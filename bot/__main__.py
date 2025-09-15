@@ -53,20 +53,19 @@ def build_bot(cfg: Config) -> commands.Bot:
     link_server: Optional[LinkServer] = None
     base_link_url: Optional[str] = None
 
-    @bot.event
-    async def on_ready():
-        logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-        # Start background update task
-        if not background_update.is_running():
-            background_update.start()
-        # Register and sync slash commands
+    _last_sync_ts: float = 0.0
+
+    async def register_slash_commands():
+        nonlocal _last_sync_ts
+        import time as _time
+        # Cooldown 60s between sync attempts
+        if (_time.time() - _last_sync_ts) < 60:
+            return
         try:
-            # Build the command object
             browse_cmd = app_commands.Command(name="browse", description="Browse Books/Movies/TV/Music and get link pages", callback=browse_slash)
             folders_cmd = app_commands.Command(name="folders", description="(Owner) Export Movies/TV top-level folders as text files", callback=folders_slash)
             if cfg.guild_id:
                 guild_obj = discord.Object(id=cfg.guild_id)
-                # Add if not present for this guild
                 existing = [c.name for c in bot.tree.get_commands(guild=guild_obj)]
                 if "browse" not in existing:
                     bot.tree.add_command(browse_cmd, guild=guild_obj)
@@ -82,8 +81,16 @@ def build_bot(cfg: Config) -> commands.Bot:
                     bot.tree.add_command(folders_cmd)
                 synced = await bot.tree.sync()
                 logger.info(f"Global slash commands synced: {[c.name for c in synced]}")
+            _last_sync_ts = _time.time()
         except Exception:
             logger.exception("Failed to register/sync slash commands")
+
+    @bot.event
+    async def on_ready():
+        logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
+        if not background_update.is_running():
+            background_update.start()
+        await register_slash_commands()
         # Start HTTP link server if enabled
         nonlocal link_server, base_link_url
         try:
@@ -99,6 +106,16 @@ def build_bot(cfg: Config) -> commands.Bot:
                 logger.info(f"HTTP link server started at {base_link_url}")
         except Exception:
             logger.exception("Failed to start HTTP link server")
+
+    @bot.event
+    async def on_connect():
+        # Re-sync on reconnect
+        await register_slash_commands()
+
+    @bot.event
+    async def on_guild_available(guild: discord.Guild):
+        # Ensure commands are present when guild becomes available
+        await register_slash_commands()
 
     @bot.event
     async def on_command_error(ctx: commands.Context, error: commands.CommandError):
@@ -243,6 +260,12 @@ def build_bot(cfg: Config) -> commands.Bot:
             await interaction.response.send_message("HTTP link server is not ready yet. Please try again shortly.", ephemeral=True)
             return
 
+        # Defer early to avoid interaction timeout
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=False)
+        except Exception:
+            pass
+
         # Preload caches
         books_data = await ensure_cache_up_to_date()
         movies_list = await ensure_movies_up_to_date()
@@ -269,7 +292,7 @@ def build_bot(cfg: Config) -> commands.Bot:
             get_tv=get_tv_local,
             get_music=get_music_local,
         )
-        await interaction.response.send_message(embed=discord.Embed(title="Browse", description="Choose a category."), view=view, ephemeral=True)
+        await interaction.followup.send(embed=discord.Embed(title="Browse", description="Choose a category."), view=view, ephemeral=True)
 
     # Owner-only: list top-level folders under Movies and TV and return as text files
     async def folders_slash(interaction: discord.Interaction):
