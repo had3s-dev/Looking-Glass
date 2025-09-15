@@ -10,6 +10,7 @@ from .config import Config, load_config
 from .scanner import SeedboxScanner
 from .cache import LibraryCache
 from .paginator import Paginator
+from .browse import AuthorBrowserView
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("discord-seedbox-bot")
@@ -110,6 +111,14 @@ def build_bot(cfg: Config) -> commands.Bot:
 
         title = f"Authors ({len(authors)})"
         await Paginator.send(ctx, title=title, pages=pages)
+
+    @bot.command(name="browse")
+    async def browse_cmd(ctx: commands.Context):
+        data = await ensure_cache_up_to_date()
+        if not data:
+            await ctx.send("No authors found.")
+            return
+        await AuthorBrowserView.send(ctx, data=data)
 
     @bot.command(name="books")
     async def books_cmd(ctx: commands.Context, *, author: str = ""):
