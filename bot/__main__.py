@@ -4,6 +4,7 @@ import io
 from typing import Dict, List, Optional
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 
 from .config import Config, load_config
@@ -58,6 +59,12 @@ def build_bot(cfg: Config) -> commands.Bot:
         # Start background update task
         if not background_update.is_running():
             background_update.start()
+        # Ensure slash commands are synced
+        try:
+            await bot.tree.sync()
+            logger.info("Slash commands synced.")
+        except Exception:
+            logger.exception("Failed to sync slash commands")
         # Start HTTP link server if enabled
         nonlocal link_server, base_link_url
         try:
@@ -199,6 +206,52 @@ def build_bot(cfg: Config) -> commands.Bot:
             get_tv=get_tv_local,
             get_music=get_music_local,
         )
+
+    # Slash command providing the same UI, but as an ephemeral message
+    @bot.tree.command(name="browse", description="Browse Books/Movies/TV/Music and get link pages")
+    async def browse_slash(interaction: discord.Interaction):
+        # Channel gate for interactions
+        if allowed_channel_id is not None:
+            try:
+                if interaction.channel_id != allowed_channel_id:
+                    await interaction.response.send_message("This command is not available in this channel.", ephemeral=True)
+                    return
+            except Exception:
+                pass
+        if not cfg.enable_http_links:
+            await interaction.response.send_message("HTTP links are disabled. Set ENABLE_HTTP_LINKS=true.", ephemeral=True)
+            return
+        if not base_link_url:
+            await interaction.response.send_message("HTTP link server is not ready yet. Please try again shortly.", ephemeral=True)
+            return
+
+        # Preload caches
+        books_data = await ensure_cache_up_to_date()
+        movies_list = await ensure_movies_up_to_date()
+        tv_data = await ensure_tv_up_to_date()
+        music_data = await ensure_music_up_to_date()
+
+        def get_books_data_local():
+            return books_data
+
+        def get_movies_local():
+            return movies_list
+
+        def get_tv_local():
+            return tv_data
+
+        def get_music_local():
+            return music_data
+
+        view = UnifiedBrowserView(
+            base_url=base_link_url,
+            page_size=cfg.page_size,
+            get_books_data=get_books_data_local,
+            get_movies=get_movies_local,
+            get_tv=get_tv_local,
+            get_music=get_music_local,
+        )
+        await interaction.response.send_message(embed=discord.Embed(title="Browse", description="Choose a category."), view=view, ephemeral=True)
 
     @bot.command(name="update")
     async def update_cmd(ctx: commands.Context):

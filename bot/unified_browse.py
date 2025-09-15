@@ -83,6 +83,12 @@ class UnifiedBrowserView(discord.ui.View):
                 await interaction.response.edit_message(embed=self._embed(title, "No authors found."), view=self)
                 return
             self.add_item(ItemSelect("Select an author", authors[:25]))
+            # Back button
+            async def on_back(inter: discord.Interaction):
+                self.category = None
+                self._show_category_buttons()
+                await inter.response.edit_message(embed=self._embed("Browse", "Choose a category."), view=self)
+            self.add_item(_make_button("Back", discord.ButtonStyle.secondary, on_back))
             await interaction.response.edit_message(embed=self._embed(title, "Pick an author to get links for all their books."), view=self)
         elif self.category == 'movies':
             movies = sorted(self.get_movies())
@@ -90,6 +96,11 @@ class UnifiedBrowserView(discord.ui.View):
                 await interaction.response.edit_message(embed=self._embed(title, "No movies found."), view=self)
                 return
             self.add_item(ItemSelect("Select a movie", movies[:25]))
+            async def on_back(inter: discord.Interaction):
+                self.category = None
+                self._show_category_buttons()
+                await inter.response.edit_message(embed=self._embed("Browse", "Choose a category."), view=self)
+            self.add_item(_make_button("Back", discord.ButtonStyle.secondary, on_back))
             await interaction.response.edit_message(embed=self._embed(title, "Pick a movie to get links."), view=self)
         elif self.category == 'tv':
             shows = sorted(list(self.get_tv().keys()))
@@ -97,6 +108,11 @@ class UnifiedBrowserView(discord.ui.View):
                 await interaction.response.edit_message(embed=self._embed(title, "No TV shows found."), view=self)
                 return
             self.add_item(ItemSelect("Select a TV show", shows[:25]))
+            async def on_back(inter: discord.Interaction):
+                self.category = None
+                self._show_category_buttons()
+                await inter.response.edit_message(embed=self._embed("Browse", "Choose a category."), view=self)
+            self.add_item(_make_button("Back", discord.ButtonStyle.secondary, on_back))
             await interaction.response.edit_message(embed=self._embed(title, "Pick a TV show to get links for all episodes."), view=self)
         elif self.category == 'music':
             artists = sorted(list(self.get_music().keys()))
@@ -104,6 +120,11 @@ class UnifiedBrowserView(discord.ui.View):
                 await interaction.response.edit_message(embed=self._embed(title, "No music artists found."), view=self)
                 return
             self.add_item(ItemSelect("Select an artist", artists[:25]))
+            async def on_back(inter: discord.Interaction):
+                self.category = None
+                self._show_category_buttons()
+                await inter.response.edit_message(embed=self._embed("Browse", "Choose a category."), view=self)
+            self.add_item(_make_button("Back", discord.ButtonStyle.secondary, on_back))
             await interaction.response.edit_message(embed=self._embed(title, "Pick an artist to get links for tracks."), view=self)
         else:
             self._show_category_buttons()
