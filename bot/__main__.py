@@ -63,18 +63,23 @@ def build_bot(cfg: Config) -> commands.Bot:
         try:
             # Build the command object
             browse_cmd = app_commands.Command(name="browse", description="Browse Books/Movies/TV/Music and get link pages", callback=browse_slash)
+            folders_cmd = app_commands.Command(name="folders", description="(Owner) Export Movies/TV top-level folders as text files", callback=folders_slash)
             if cfg.guild_id:
                 guild_obj = discord.Object(id=cfg.guild_id)
                 # Add if not present for this guild
                 existing = [c.name for c in bot.tree.get_commands(guild=guild_obj)]
                 if "browse" not in existing:
                     bot.tree.add_command(browse_cmd, guild=guild_obj)
+                if "folders" not in existing:
+                    bot.tree.add_command(folders_cmd, guild=guild_obj)
                 synced = await bot.tree.sync(guild=guild_obj)
                 logger.info(f"Slash commands synced for guild {cfg.guild_id}: {[c.name for c in synced]}")
             else:
                 existing = [c.name for c in bot.tree.get_commands()]
                 if "browse" not in existing:
                     bot.tree.add_command(browse_cmd)
+                if "folders" not in existing:
+                    bot.tree.add_command(folders_cmd)
                 synced = await bot.tree.sync()
                 logger.info(f"Global slash commands synced: {[c.name for c in synced]}")
         except Exception:
