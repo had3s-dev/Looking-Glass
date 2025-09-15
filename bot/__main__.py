@@ -38,15 +38,17 @@ def build_bot(cfg: Config) -> commands.Bot:
         file_extensions=cfg.file_extensions,
     )
 
-    # Restrict commands to a single channel if configured
+    # Restrict commands to channels if configured
     allowed_channel_id = cfg.allowed_channel_id
+    allowed_channel_ids = set(cfg.allowed_channel_ids or ([] if allowed_channel_id is None else [allowed_channel_id]))
 
     @bot.check
     async def channel_gate(ctx: commands.Context) -> bool:
-        if allowed_channel_id is None:
+        # If no restrictions configured, allow everywhere
+        if not allowed_channel_ids:
             return True
         try:
-            return ctx.channel and ctx.channel.id == allowed_channel_id
+            return bool(ctx.channel and ctx.channel.id in allowed_channel_ids)
         except Exception:
             return False
 
@@ -65,17 +67,22 @@ def build_bot(cfg: Config) -> commands.Bot:
             browse_cmd = app_commands.Command(name="browse", description="Browse Books/Movies/TV/Music and get link pages", callback=browse_slash)
             folders_cmd = app_commands.Command(name="folders", description="(Owner) Export Movies/TV top-level folders as text files", callback=folders_slash)
             list_cmd = app_commands.Command(name="list", description="(Owner) Export full file lists for Movies/TV as text files", callback=list_slash)
-            if cfg.guild_id:
-                guild_obj = discord.Object(id=cfg.guild_id)
-                existing = [c.name for c in bot.tree.get_commands(guild=guild_obj)]
-                if "browse" not in existing:
-                    bot.tree.add_command(browse_cmd, guild=guild_obj)
-                if "folders" not in existing:
-                    bot.tree.add_command(folders_cmd, guild=guild_obj)
-                if "list" not in existing:
-                    bot.tree.add_command(list_cmd, guild=guild_obj)
-                synced = await bot.tree.sync(guild=guild_obj)
-                logger.info(f"Slash commands synced for guild {cfg.guild_id}: {[c.name for c in synced]}")
+            # Prefer multi-guild list; fallback to single guild_id; else global
+            target_guild_ids = cfg.guild_ids or ([cfg.guild_id] if cfg.guild_id else [])
+            if target_guild_ids:
+                for gid in target_guild_ids:
+                    if gid is None:
+                        continue
+                    guild_obj = discord.Object(id=gid)
+                    existing = [c.name for c in bot.tree.get_commands(guild=guild_obj)]
+                    if "browse" not in existing:
+                        bot.tree.add_command(browse_cmd, guild=guild_obj)
+                    if "folders" not in existing:
+                        bot.tree.add_command(folders_cmd, guild=guild_obj)
+                    if "list" not in existing:
+                        bot.tree.add_command(list_cmd, guild=guild_obj)
+                    synced = await bot.tree.sync(guild=guild_obj)
+                    logger.info(f"Slash commands synced for guild {gid}: {[c.name for c in synced]}")
             else:
                 existing = [c.name for c in bot.tree.get_commands()]
                 if "browse" not in existing:

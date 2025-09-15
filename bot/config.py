@@ -40,6 +40,9 @@ class Config:
     cache_ttl_seconds: int
     allowed_channel_id: Optional[int]
     guild_id: Optional[int]
+    # Multi-ID support
+    allowed_channel_ids: List[int]
+    guild_ids: List[int]
     owner_user_id: Optional[int]
 
     # Downloads
@@ -83,6 +86,22 @@ def getenv_int_optional(name: str) -> Optional[int]:
         return None
 
 
+def getenv_int_list(name: str) -> List[int]:
+    v = os.getenv(name)
+    if not v:
+        return []
+    out: List[int] = []
+    for part in v.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            continue
+    return out
+
+
 def load_config() -> Config:
     # Load .env if present
     load_dotenv()
@@ -120,6 +139,12 @@ def load_config() -> Config:
         cache_ttl_seconds=getenv_int("CACHE_TTL_SECONDS", 900),
         allowed_channel_id=getenv_int_optional("ALLOWED_CHANNEL_ID"),
         guild_id=getenv_int_optional("GUILD_ID"),
+        allowed_channel_ids=(lambda singles, multi: (multi if multi else ([singles] if singles is not None else [])))(
+            getenv_int_optional("ALLOWED_CHANNEL_ID"), getenv_int_list("ALLOWED_CHANNEL_IDS")
+        ),
+        guild_ids=(lambda single, multi: (multi if multi else ([single] if single is not None else [])))(
+            getenv_int_optional("GUILD_ID"), getenv_int_list("GUILD_IDS")
+        ),
         owner_user_id=getenv_int_optional("OWNER_USER_ID"),
         enable_downloads=os.getenv("ENABLE_DOWNLOADS", "false").lower() in ("1", "true", "yes"),
         max_upload_bytes=getenv_int("MAX_UPLOAD_BYTES", 8_000_000),
