@@ -352,8 +352,8 @@ def build_bot(cfg: Config) -> commands.Bot:
             return
         await interaction.response.send_message(content="Here are the current top-level folders.", files=files, ephemeral=True)
 
-    # Owner-only: list all files recursively for Movies and TV and send as Markdown lists
-    async def list_slash(interaction: discord.Interaction):
+    # Owner-only: list folder names: Movies (top-level dirs), TV (shows with seasons)
+    async def list_slash(interaction: discord.Interaction, kind: Optional[str] = None):
         if cfg.owner_user_id is not None and interaction.user.id != cfg.owner_user_id:
             await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
@@ -361,28 +361,23 @@ def build_bot(cfg: Config) -> commands.Bot:
             await interaction.response.defer(ephemeral=True, thinking=False)
         except Exception:
             pass
-        async def collect_files(root: Optional[str], exts: List[str]) -> List[str]:
+        # Normalize filter
+        filt = (kind or "").strip().lower()
+        movies_only = filt in ("movies", "movie", "m")
+        tv_only = filt in ("tv", "shows", "show", "s")
+        async def collect_movie_dirs(root: Optional[str]) -> List[str]:
             if not root:
                 return []
             loop = asyncio.get_running_loop()
-            def _walk():
+            def _collect():
                 out: List[str] = []
                 sftp = None
-                import posixpath as _pp
                 try:
                     sftp = scanner._connect()
-                    stack = [root]
-                    while stack:
-                        d = stack.pop()
+                    for e in sftp.listdir_attr(root):
                         try:
-                            for e in sftp.listdir_attr(d):
-                                p = _pp.join(d, e.filename)
-                                if (e.st_mode & 0o170000) == 0o040000:
-                                    stack.append(p)
-                                else:
-                                    if any(e.filename.lower().endswith(ext.lower()) for ext in exts):
-                                        rel = p[len(root):].lstrip('/')
-                                        out.append(rel or e.filename)
+                            if (e.st_mode & 0o170000) == 0o040000:
+                                out.append(e.filename)
                         except Exception:
                             continue
                 finally:
@@ -392,27 +387,69 @@ def build_bot(cfg: Config) -> commands.Bot:
                     except Exception:
                         pass
                 return sorted(out)
-            return await loop.run_in_executor(None, _walk)
+            return await loop.run_in_executor(None, _collect)
 
-        movies_files, tv_files = await asyncio.gather(
-            collect_files(cfg.movies_root_path, cfg.movie_extensions),
-            collect_files(cfg.tv_root_path, cfg.tv_extensions),
-        )
+        async def collect_tv_dirs_and_seasons(root: Optional[str]) -> Dict[str, List[str]]:
+            if not root:
+                return {}
+            loop = asyncio.get_running_loop()
+            def _collect():
+                out: Dict[str, List[str]] = {}
+                sftp = None
+                import posixpath as _pp
+                try:
+                    sftp = scanner._connect()
+                    for show in sftp.listdir_attr(root):
+                        try:
+                            if (show.st_mode & 0o170000) != 0o040000:
+                                continue
+                            show_name = show.filename
+                            seasons: List[str] = []
+                            show_path = _pp.join(root, show_name)
+                            for sub in sftp.listdir_attr(show_path):
+                                try:
+                                    if (sub.st_mode & 0o170000) == 0o040000:
+                                        seasons.append(sub.filename)
+                                except Exception:
+                                    continue
+                            out[show_name] = sorted(seasons)
+                        except Exception:
+                            continue
+                finally:
+                    try:
+                        if sftp:
+                            sftp.close()
+                    except Exception:
+                        pass
+                return dict(sorted(out.items(), key=lambda kv: kv[0].lower()))
+            return await loop.run_in_executor(None, _collect)
 
-        if not movies_files and not tv_files:
+        # Collect according to filter
+        movies_dirs: List[str] = []
+        tv_map: Dict[str, List[str]] = {}
+        if not tv_only:
+            movies_dirs = await collect_movie_dirs(cfg.movies_root_path)
+        if not movies_only:
+            tv_map = await collect_tv_dirs_and_seasons(cfg.tv_root_path)
+
+        if not movies_dirs and not tv_map:
             await interaction.followup.send("No files found (check MOVIES_ROOT_PATH/TV_ROOT_PATH).", ephemeral=True)
             return
         # Build markdown strings and chunk to Discord limits (~2000 chars)
         def make_sections():
             sections: List[str] = []
-            if movies_files:
-                header = f"**Movies files ({len(movies_files)})**\n"
-                body = "\n".join(f"- {p}" for p in movies_files)
+            if movies_dirs and not tv_only:
+                header = f"**Movies (folders) ({len(movies_dirs)})**\n"
+                body = "\n".join(f"- {n}" for n in movies_dirs)
                 sections.append(header + body)
-            if tv_files:
-                header = f"**TV files ({len(tv_files)})**\n"
-                body = "\n".join(f"- {p}" for p in tv_files)
-                sections.append(header + body)
+            if tv_map and not movies_only:
+                header = f"**TV Shows (folders) ({len(tv_map)})**\n"
+                lines: List[str] = []
+                for show, seasons in tv_map.items():
+                    lines.append(f"- {show}")
+                    for s in seasons:
+                        lines.append(f"  - {s}")
+                sections.append(header + "\n".join(lines))
             return sections
         sections = make_sections()
         # Send each section split into chunks <= 1900 chars
@@ -501,9 +538,12 @@ def build_bot(cfg: Config) -> commands.Bot:
 
     # Owner-only prefix fallback: !list (DMs the owner)
     @bot.command(name="list")
-    async def list_cmd(ctx: commands.Context):
+    async def list_cmd(ctx: commands.Context, *, kind: Optional[str] = None):
         if cfg.owner_user_id is not None and ctx.author.id != cfg.owner_user_id:
             return
+        filt = (kind or "").strip().lower()
+        movies_only = filt in ("movies", "movie", "m")
+        tv_only = filt in ("tv", "shows", "show", "s")
         async def collect_files(root: Optional[str], exts: List[str]) -> List[str]:
             if not root:
                 return []
