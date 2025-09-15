@@ -40,6 +40,7 @@ class Config:
     cache_ttl_seconds: int
     allowed_channel_id: Optional[int]
     guild_id: Optional[int]
+    owner_user_id: Optional[int]
 
     # Downloads
     enable_downloads: bool
@@ -119,6 +120,7 @@ def load_config() -> Config:
         cache_ttl_seconds=getenv_int("CACHE_TTL_SECONDS", 900),
         allowed_channel_id=getenv_int_optional("ALLOWED_CHANNEL_ID"),
         guild_id=getenv_int_optional("GUILD_ID"),
+        owner_user_id=getenv_int_optional("OWNER_USER_ID"),
         enable_downloads=os.getenv("ENABLE_DOWNLOADS", "false").lower() in ("1", "true", "yes"),
         max_upload_bytes=getenv_int("MAX_UPLOAD_BYTES", 8_000_000),
         enable_http_links=os.getenv("ENABLE_HTTP_LINKS", "false").lower() in ("1", "true", "yes"),

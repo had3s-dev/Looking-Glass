@@ -266,6 +266,59 @@ def build_bot(cfg: Config) -> commands.Bot:
         )
         await interaction.response.send_message(embed=discord.Embed(title="Browse", description="Choose a category."), view=view, ephemeral=True)
 
+    # Owner-only: list top-level folders under Movies and TV and return as text files
+    async def folders_slash(interaction: discord.Interaction):
+        # Permission check
+        if cfg.owner_user_id is not None and interaction.user.id != cfg.owner_user_id:
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        # Build lists using SFTP in thread pool to avoid blocking
+        async def collect_dirs(root: Optional[str]) -> List[str]:
+            if not root:
+                return []
+            loop = asyncio.get_running_loop()
+            def _collect():
+                names: List[str] = []
+                sftp = None
+                try:
+                    sftp = scanner._connect()
+                    for e in sftp.listdir_attr(root):
+                        try:
+                            # dir bit
+                            if (e.st_mode & 0o170000) == 0o040000:
+                                names.append(e.filename)
+                        except Exception:
+                            continue
+                except Exception:
+                    return names
+                finally:
+                    try:
+                        if sftp:
+                            sftp.close()
+                    except Exception:
+                        pass
+                return sorted(names)
+            return await loop.run_in_executor(None, _collect)
+
+        movies_dirs, tv_dirs = await asyncio.gather(
+            collect_dirs(cfg.movies_root_path),
+            collect_dirs(cfg.tv_root_path),
+        )
+
+        # Prepare files
+        import io as _io
+        files: List[discord.File] = []
+        if movies_dirs:
+            movies_text = "\n".join(movies_dirs) + "\n"
+            files.append(discord.File(fp=_io.BytesIO(movies_text.encode("utf-8")), filename="movies_folders.txt"))
+        if tv_dirs:
+            tv_text = "\n".join(tv_dirs) + "\n"
+            files.append(discord.File(fp=_io.BytesIO(tv_text.encode("utf-8")), filename="tvshow_folders.txt"))
+        if not files:
+            await interaction.response.send_message("No folders found (check MOVIES_ROOT_PATH and TV_ROOT_PATH).", ephemeral=True)
+            return
+        await interaction.response.send_message(content="Here are the current top-level folders.", files=files, ephemeral=True)
+
     @bot.command(name="update")
     async def update_cmd(ctx: commands.Context):
         await ctx.send("Updating library, please wait...")
