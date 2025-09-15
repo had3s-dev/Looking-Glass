@@ -49,6 +49,9 @@ class UnifiedBrowserView(discord.ui.View):
         self.get_tv = get_tv
         self.get_music = get_music
         self.category: Optional[str] = None
+        self.per_page: int = 25
+        self.page_index: int = 0
+        self._current_list: List[str] = []  # items for current category
         self._show_category_buttons()
 
     def _embed(self, title: str, description: str) -> discord.Embed:
@@ -73,16 +76,53 @@ class UnifiedBrowserView(discord.ui.View):
         self.add_item(_make_button("TV", discord.ButtonStyle.primary, on_tv))
         self.add_item(_make_button("Music", discord.ButtonStyle.primary, on_music))
 
+    def _rebuild_category_controls(self, title: str, placeholder: str, total: int):
+        # Build select for current page and nav buttons
+        start = self.page_index * self.per_page
+        end = min(start + self.per_page, total)
+        page_items = self._current_list[start:end]
+        self.add_item(ItemSelect(placeholder, page_items))
+        # Nav buttons
+        async def to_first(inter: discord.Interaction):
+            self.page_index = 0
+            await self._refresh_category(inter)
+        async def to_prev(inter: discord.Interaction):
+            if self.page_index > 0:
+                self.page_index -= 1
+            await self._refresh_category(inter)
+        async def to_next(inter: discord.Interaction):
+            if (self.page_index + 1) * self.per_page < total:
+                self.page_index += 1
+            await self._refresh_category(inter)
+        async def to_last(inter: discord.Interaction):
+            self.page_index = max(0, (total - 1) // self.per_page)
+            await self._refresh_category(inter)
+        first_btn = _make_button("⏮", discord.ButtonStyle.secondary, to_first)
+        prev_btn = _make_button("◀", discord.ButtonStyle.secondary, to_prev)
+        next_btn = _make_button("▶", discord.ButtonStyle.secondary, to_next)
+        last_btn = _make_button("⏭", discord.ButtonStyle.secondary, to_last)
+        # Disable according to bounds
+        first_btn.disabled = self.page_index <= 0
+        prev_btn.disabled = self.page_index <= 0
+        last_page_index = max(0, (total - 1) // self.per_page)
+        next_btn.disabled = self.page_index >= last_page_index
+        last_btn.disabled = self.page_index >= last_page_index
+        self.add_item(first_btn)
+        self.add_item(prev_btn)
+        self.add_item(next_btn)
+        self.add_item(last_btn)
+
     async def _show_category(self, interaction: discord.Interaction):
         self.clear_items()
         title = f"Browse: {self.category.title() if self.category else ''}"
         if self.category == 'books':
             data = self.get_books_data()
-            authors = sorted(list(data.keys()))
-            if not authors:
+            self._current_list = sorted(list(data.keys()))
+            self.page_index = 0
+            if not self._current_list:
                 await interaction.response.edit_message(embed=self._embed(title, "No authors found."), view=self)
                 return
-            self.add_item(ItemSelect("Select an author", authors[:25]))
+            self._rebuild_category_controls(title, "Select an author", len(self._current_list))
             # Back button
             async def on_back(inter: discord.Interaction):
                 self.category = None
@@ -91,11 +131,12 @@ class UnifiedBrowserView(discord.ui.View):
             self.add_item(_make_button("Back", discord.ButtonStyle.secondary, on_back))
             await interaction.response.edit_message(embed=self._embed(title, "Pick an author to get links for all their books."), view=self)
         elif self.category == 'movies':
-            movies = sorted(self.get_movies())
-            if not movies:
+            self._current_list = sorted(self.get_movies())
+            self.page_index = 0
+            if not self._current_list:
                 await interaction.response.edit_message(embed=self._embed(title, "No movies found."), view=self)
                 return
-            self.add_item(ItemSelect("Select a movie", movies[:25]))
+            self._rebuild_category_controls(title, "Select a movie", len(self._current_list))
             async def on_back(inter: discord.Interaction):
                 self.category = None
                 self._show_category_buttons()
@@ -103,11 +144,12 @@ class UnifiedBrowserView(discord.ui.View):
             self.add_item(_make_button("Back", discord.ButtonStyle.secondary, on_back))
             await interaction.response.edit_message(embed=self._embed(title, "Pick a movie to get links."), view=self)
         elif self.category == 'tv':
-            shows = sorted(list(self.get_tv().keys()))
-            if not shows:
+            self._current_list = sorted(list(self.get_tv().keys()))
+            self.page_index = 0
+            if not self._current_list:
                 await interaction.response.edit_message(embed=self._embed(title, "No TV shows found."), view=self)
                 return
-            self.add_item(ItemSelect("Select a TV show", shows[:25]))
+            self._rebuild_category_controls(title, "Select a TV show", len(self._current_list))
             async def on_back(inter: discord.Interaction):
                 self.category = None
                 self._show_category_buttons()
@@ -115,11 +157,12 @@ class UnifiedBrowserView(discord.ui.View):
             self.add_item(_make_button("Back", discord.ButtonStyle.secondary, on_back))
             await interaction.response.edit_message(embed=self._embed(title, "Pick a TV show to get links for all episodes."), view=self)
         elif self.category == 'music':
-            artists = sorted(list(self.get_music().keys()))
-            if not artists:
+            self._current_list = sorted(list(self.get_music().keys()))
+            self.page_index = 0
+            if not self._current_list:
                 await interaction.response.edit_message(embed=self._embed(title, "No music artists found."), view=self)
                 return
-            self.add_item(ItemSelect("Select an artist", artists[:25]))
+            self._rebuild_category_controls(title, "Select an artist", len(self._current_list))
             async def on_back(inter: discord.Interaction):
                 self.category = None
                 self._show_category_buttons()
@@ -139,6 +182,43 @@ class UnifiedBrowserView(discord.ui.View):
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label="Open Links", url=url))
         await interaction.response.send_message(f"Links for {self.category.title()}: {item_name}", view=view, ephemeral=True)
+
+    async def _refresh_category(self, interaction: discord.Interaction):
+        # Re-render current category keeping new page index
+        self.clear_items()
+        title = f"Browse: {self.category.title() if self.category else ''}"
+        if self.category == 'books':
+            self._rebuild_category_controls(title, "Select an author", len(self._current_list))
+            async def on_back(inter: discord.Interaction):
+                self.category = None
+                self._show_category_buttons()
+                await inter.response.edit_message(embed=self._embed("Browse", "Choose a category."), view=self)
+            self.add_item(_make_button("Back", discord.ButtonStyle.secondary, on_back))
+            await interaction.response.edit_message(embed=self._embed(title, "Pick an author to get links for all their books."), view=self)
+        elif self.category == 'movies':
+            self._rebuild_category_controls(title, "Select a movie", len(self._current_list))
+            async def on_back(inter: discord.Interaction):
+                self.category = None
+                self._show_category_buttons()
+                await inter.response.edit_message(embed=self._embed("Browse", "Choose a category."), view=self)
+            self.add_item(_make_button("Back", discord.ButtonStyle.secondary, on_back))
+            await interaction.response.edit_message(embed=self._embed(title, "Pick a movie to get links."), view=self)
+        elif self.category == 'tv':
+            self._rebuild_category_controls(title, "Select a TV show", len(self._current_list))
+            async def on_back(inter: discord.Interaction):
+                self.category = None
+                self._show_category_buttons()
+                await inter.response.edit_message(embed=self._embed("Browse", "Choose a category."), view=self)
+            self.add_item(_make_button("Back", discord.ButtonStyle.secondary, on_back))
+            await interaction.response.edit_message(embed=self._embed(title, "Pick a TV show to get links for all episodes."), view=self)
+        elif self.category == 'music':
+            self._rebuild_category_controls(title, "Select an artist", len(self._current_list))
+            async def on_back(inter: discord.Interaction):
+                self.category = None
+                self._show_category_buttons()
+                await inter.response.edit_message(embed=self._embed("Browse", "Choose a category."), view=self)
+            self.add_item(_make_button("Back", discord.ButtonStyle.secondary, on_back))
+            await interaction.response.edit_message(embed=self._embed(title, "Pick an artist to get links for tracks."), view=self)
 
     @staticmethod
     async def send(ctx, base_url: str, page_size: int, get_books_data, get_movies, get_tv, get_music):
