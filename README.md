@@ -1,8 +1,9 @@
 # Discord Seedbox Library Bot
 
-A Discord bot you can deploy to Railway that lists authors and their books from your Whatbox seedbox. It supports:
+A Discord bot you can deploy to Railway that lists your Books/Movies/TV/Music from your Whatbox seedbox and shares expiring links via a lightweight HTTP server.
 
-- Commands: `!authors`, `!books <author>`, `!update`, `!help`
+- Commands: `!browseall` (unified categories UI), `!getbook <author> | <book title>`, `!update`, `!help`
+- Optional downloads: `!getbook <author> | <book title>` (small files only; see config)
 - SFTP scanning of your library with flexible layout handling
 - Automatic background refresh every 30 minutes and manual `!update`
 - Pagination with Discord buttons for long lists
@@ -18,14 +19,14 @@ The scanner supports common layouts:
   - `/root/Author Name/Book Title.epub`
 - Flat files under root with pattern `Author - Book.ext` (e.g., `Isaac Asimov - Foundation.epub`)
 
-Extensions default to: `.epub,.mobi,.pdf,.azw3` but can be customized.
+Extensions default to: `.epub,.mobi,.pdf,.azw3` for books, common video formats for movies/TV, and common audio formats for music, but can be customized.
 
 ## Commands
 
-- `!authors` – List all authors.
-- `!books <author>` – List books for the specified author. Partial, case-insensitive author matches are supported.
+- `!browseall` – Open a single browse UI in Discord with categories (Books/Movies/TV/Music). Selecting an item provides a link page with expiring, signed download links.
 - `!update` – Force a rescan of the library.
 - `!help` – Show command help.
+- `!getbook <author> | <book title>` – Download and upload a book file if downloads are enabled and the file is under the configured upload size.
 
 ## Configuration
 
@@ -37,15 +38,24 @@ Required:
 - `SFTP_HOST` – Whatbox SFTP host (e.g., `slotname.whatbox.ca`).
 - `SFTP_USERNAME` – Your Whatbox username.
 - `SFTP_PASSWORD` or `SSH_KEY_PATH` – Use one; password auth or private key.
-- `LIBRARY_ROOT_PATH` – The root directory to scan (e.g., `/home/username/books`).
+- `LIBRARY_ROOT_PATH` – The root directory for books (e.g., `/home/username/books`).
 
 Optional:
 
 - `COMMAND_PREFIX` (default `!`)
 - `SFTP_PORT` (default `22`)
 - `FILE_EXTENSIONS` (comma-separated, default `.epub,.mobi,.pdf,.azw3`)
+- `MOVIES_ROOT_PATH` – Root for movies (e.g., `/media/movies`)
+- `MOVIE_EXTENSIONS` – Comma-separated list (default `.mp4,.mkv,.avi,.mov`)
+- `TV_ROOT_PATH` – Root for TV shows (e.g., `/media/tv`)
+- `TV_EXTENSIONS` – Comma-separated list (default `.mp4,.mkv,.avi,.mov`)
+- `MUSIC_ROOT_PATH` – Root for music (e.g., `/media/music`)
+- `MUSIC_EXTENSIONS` – Comma-separated list (default `.mp3,.flac,.m4a,.wav`)
 - `PAGE_SIZE` (default `20`)
 - `CACHE_TTL_SECONDS` (default `900`)
+- `ALLOWED_CHANNEL_ID` – If set, restrict commands to a single channel ID.
+- `ENABLE_DOWNLOADS` – `true/false` (default `false`). Enables the `!getbook` command.
+- `MAX_UPLOAD_BYTES` – Max size for upload to Discord (default `8000000` i.e. ~8MB). Note: Discord server limits may apply depending on Nitro/boost level.
 
 ## Local Run
 
@@ -84,16 +94,24 @@ If you prefer key-based auth, you have two options:
 
 ## Notes
 
-- The bot paginates output using interactive buttons. If your guild disables message content intent or buttons, adjust Discord settings accordingly.
+- The unified browse UI provides buttons and link pages. If your guild disables message content intent or buttons, adjust Discord settings accordingly.
 - Large libraries: the bot caches results for `CACHE_TTL_SECONDS` to avoid excessive SFTP calls. `!update` bypasses cache and rescans.
+- Movies/TV/Music scanning is optional; leave their root env vars unset to disable those features.
+- Downloads are limited to small files and currently implemented for books only. If you’d like movie/TV/music downloads or link generation (e.g., HTTP links), open an issue or extend the bot accordingly.
+
+### HTTP Link Server
+
+- Set `ENABLE_HTTP_LINKS=true` to enable the internal `aiohttp` server that serves a simple links page and signed download endpoints.
+- Configure `HTTP_HOST`, `HTTP_PORT`, `PUBLIC_BASE_URL` (if using a reverse proxy), `LINK_TTL_SECONDS`, and `LINK_SECRET`.
 
 ## Project Structure
 
-- `bot/__main__.py` – Entry point, command setup, background tasks
+- `bot/__main__.py` – Entry point, command setup, background tasks, starts HTTP link server
 - `bot/config.py` – Loads environment variables
 - `bot/scanner.py` – SFTP scanner that builds `{ author: [books...] }`
 - `bot/cache.py` – Simple TTL cache
-- `bot/paginator.py` – Button-based paginator
+- `bot/web.py` – Internal `aiohttp` app for links and signed downloads
+- `bot/unified_browse.py` – Unified Discord category browser that links to the link pages
 - `requirements.txt` – Dependencies
 - `Procfile` – Railway process definition
 

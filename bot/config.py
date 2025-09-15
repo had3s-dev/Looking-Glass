@@ -20,13 +20,37 @@ class Config:
     ssh_key_path: Optional[str]
 
     # Library scanning
-    library_root_path: str
-    file_extensions: List[str]
+    library_root_path: str  # Books root
+    file_extensions: List[str]  # Book extensions
+
+    # Movies scanning
+    movies_root_path: Optional[str]
+    movie_extensions: List[str]
+
+    # TV scanning
+    tv_root_path: Optional[str]
+    tv_extensions: List[str]
+
+    # Music scanning
+    music_root_path: Optional[str]
+    music_extensions: List[str]
 
     # Behavior
     page_size: int
     cache_ttl_seconds: int
     allowed_channel_id: Optional[int]
+
+    # Downloads
+    enable_downloads: bool
+    max_upload_bytes: int
+
+    # HTTP link server
+    enable_http_links: bool
+    http_host: str
+    http_port: int
+    public_base_url: Optional[str]
+    link_ttl_seconds: int
+    link_secret: Optional[str]
 
 
 def getenv_int(name: str, default: int) -> int:
@@ -84,7 +108,21 @@ def load_config() -> Config:
         ssh_key_path=ssh_key_path,
         library_root_path=os.getenv("LIBRARY_ROOT_PATH", "/media/books"),
         file_extensions=getenv_list("FILE_EXTENSIONS", [".epub", ".mobi", ".pdf", ".azw3"]),
+        movies_root_path=os.getenv("MOVIES_ROOT_PATH"),
+        movie_extensions=getenv_list("MOVIE_EXTENSIONS", [".mp4", ".mkv", ".avi", ".mov"]),
+        tv_root_path=os.getenv("TV_ROOT_PATH"),
+        tv_extensions=getenv_list("TV_EXTENSIONS", [".mp4", ".mkv", ".avi", ".mov"]),
+        music_root_path=os.getenv("MUSIC_ROOT_PATH"),
+        music_extensions=getenv_list("MUSIC_EXTENSIONS", [".mp3", ".flac", ".m4a", ".wav"]),
         page_size=getenv_int("PAGE_SIZE", 20),
         cache_ttl_seconds=getenv_int("CACHE_TTL_SECONDS", 900),
         allowed_channel_id=getenv_int_optional("ALLOWED_CHANNEL_ID"),
+        enable_downloads=os.getenv("ENABLE_DOWNLOADS", "false").lower() in ("1", "true", "yes"),
+        max_upload_bytes=getenv_int("MAX_UPLOAD_BYTES", 8_000_000),
+        enable_http_links=os.getenv("ENABLE_HTTP_LINKS", "false").lower() in ("1", "true", "yes"),
+        http_host=os.getenv("HTTP_HOST", "0.0.0.0"),
+        http_port=getenv_int("HTTP_PORT", 8080),
+        public_base_url=os.getenv("PUBLIC_BASE_URL"),
+        link_ttl_seconds=getenv_int("LINK_TTL_SECONDS", 900),
+        link_secret=os.getenv("LINK_SECRET"),
     )
