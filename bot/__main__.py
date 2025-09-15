@@ -64,6 +64,7 @@ def build_bot(cfg: Config) -> commands.Bot:
         try:
             browse_cmd = app_commands.Command(name="browse", description="Browse Books/Movies/TV/Music and get link pages", callback=browse_slash)
             folders_cmd = app_commands.Command(name="folders", description="(Owner) Export Movies/TV top-level folders as text files", callback=folders_slash)
+            list_cmd = app_commands.Command(name="list", description="(Owner) Export full file lists for Movies/TV as text files", callback=list_slash)
             if cfg.guild_id:
                 guild_obj = discord.Object(id=cfg.guild_id)
                 existing = [c.name for c in bot.tree.get_commands(guild=guild_obj)]
@@ -71,6 +72,8 @@ def build_bot(cfg: Config) -> commands.Bot:
                     bot.tree.add_command(browse_cmd, guild=guild_obj)
                 if "folders" not in existing:
                     bot.tree.add_command(folders_cmd, guild=guild_obj)
+                if "list" not in existing:
+                    bot.tree.add_command(list_cmd, guild=guild_obj)
                 synced = await bot.tree.sync(guild=guild_obj)
                 logger.info(f"Slash commands synced for guild {cfg.guild_id}: {[c.name for c in synced]}")
             else:
@@ -79,6 +82,8 @@ def build_bot(cfg: Config) -> commands.Bot:
                     bot.tree.add_command(browse_cmd)
                 if "folders" not in existing:
                     bot.tree.add_command(folders_cmd)
+                if "list" not in existing:
+                    bot.tree.add_command(list_cmd)
                 synced = await bot.tree.sync()
                 logger.info(f"Global slash commands synced: {[c.name for c in synced]}")
             _last_sync_ts = _time.time()
@@ -347,6 +352,83 @@ def build_bot(cfg: Config) -> commands.Bot:
             return
         await interaction.response.send_message(content="Here are the current top-level folders.", files=files, ephemeral=True)
 
+    # Owner-only: list all files recursively for Movies and TV and send as Markdown lists
+    async def list_slash(interaction: discord.Interaction):
+        if cfg.owner_user_id is not None and interaction.user.id != cfg.owner_user_id:
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=False)
+        except Exception:
+            pass
+        async def collect_files(root: Optional[str], exts: List[str]) -> List[str]:
+            if not root:
+                return []
+            loop = asyncio.get_running_loop()
+            def _walk():
+                out: List[str] = []
+                sftp = None
+                import posixpath as _pp
+                try:
+                    sftp = scanner._connect()
+                    stack = [root]
+                    while stack:
+                        d = stack.pop()
+                        try:
+                            for e in sftp.listdir_attr(d):
+                                p = _pp.join(d, e.filename)
+                                if (e.st_mode & 0o170000) == 0o040000:
+                                    stack.append(p)
+                                else:
+                                    if any(e.filename.lower().endswith(ext.lower()) for ext in exts):
+                                        rel = p[len(root):].lstrip('/')
+                                        out.append(rel or e.filename)
+                        except Exception:
+                            continue
+                finally:
+                    try:
+                        if sftp:
+                            sftp.close()
+                    except Exception:
+                        pass
+                return sorted(out)
+            return await loop.run_in_executor(None, _walk)
+
+        movies_files, tv_files = await asyncio.gather(
+            collect_files(cfg.movies_root_path, cfg.movie_extensions),
+            collect_files(cfg.tv_root_path, cfg.tv_extensions),
+        )
+
+        if not movies_files and not tv_files:
+            await interaction.followup.send("No files found (check MOVIES_ROOT_PATH/TV_ROOT_PATH).", ephemeral=True)
+            return
+        # Build markdown strings and chunk to Discord limits (~2000 chars)
+        def make_sections():
+            sections: List[str] = []
+            if movies_files:
+                header = f"**Movies files ({len(movies_files)})**\n"
+                body = "\n".join(f"- {p}" for p in movies_files)
+                sections.append(header + body)
+            if tv_files:
+                header = f"**TV files ({len(tv_files)})**\n"
+                body = "\n".join(f"- {p}" for p in tv_files)
+                sections.append(header + body)
+            return sections
+        sections = make_sections()
+        # Send each section split into chunks <= 1900 chars
+        for section in sections:
+            content = section
+            while content:
+                chunk = content[:1900]
+                # Try to split at last newline to avoid breaking an item
+                if len(content) > 1900 and "\n" in chunk:
+                    split = chunk.rfind("\n")
+                    chunk = content[:split]
+                    content = content[split+1:]
+                else:
+                    content = content[len(chunk):]
+                await interaction.followup.send(chunk, ephemeral=True)
+
     @bot.command(name="update")
     async def update_cmd(ctx: commands.Context):
         await ctx.send("Updating library, please wait...")
@@ -416,6 +498,80 @@ def build_bot(cfg: Config) -> commands.Bot:
         fileobj = io.BytesIO(data)
         fileobj.seek(0)
         await ctx.send(file=discord.File(fileobj, filename=fname))
+
+    # Owner-only prefix fallback: !list (DMs the owner)
+    @bot.command(name="list")
+    async def list_cmd(ctx: commands.Context):
+        if cfg.owner_user_id is not None and ctx.author.id != cfg.owner_user_id:
+            return
+        async def collect_files(root: Optional[str], exts: List[str]) -> List[str]:
+            if not root:
+                return []
+            loop = asyncio.get_running_loop()
+            def _walk():
+                out: List[str] = []
+                sftp = None
+                import posixpath as _pp
+                try:
+                    sftp = scanner._connect()
+                    stack = [root]
+                    while stack:
+                        d = stack.pop()
+                        try:
+                            for e in sftp.listdir_attr(d):
+                                p = _pp.join(d, e.filename)
+                                if (e.st_mode & 0o170000) == 0o040000:
+                                    stack.append(p)
+                                else:
+                                    if any(e.filename.lower().endswith(ext.lower()) for ext in exts):
+                                        rel = p[len(root):].lstrip('/')
+                                        out.append(rel or e.filename)
+                        except Exception:
+                            continue
+                finally:
+                    try:
+                        if sftp:
+                            sftp.close()
+                    except Exception:
+                        pass
+                return sorted(out)
+            return await loop.run_in_executor(None, _walk)
+
+        movies_files, tv_files = await asyncio.gather(
+            collect_files(cfg.movies_root_path, cfg.movie_extensions),
+            collect_files(cfg.tv_root_path, cfg.tv_extensions),
+        )
+        if not movies_files and not tv_files:
+            await ctx.reply("No files found (check MOVIES_ROOT_PATH/TV_ROOT_PATH).", mention_author=False)
+            return
+        # Build markdown sections
+        def make_sections():
+            sections: List[str] = []
+            if movies_files:
+                header = f"**Movies files ({len(movies_files)})**\n"
+                body = "\n".join(f"- {p}" for p in movies_files)
+                sections.append(header + body)
+            if tv_files:
+                header = f"**TV files ({len(tv_files)})**\n"
+                body = "\n".join(f"- {p}" for p in tv_files)
+                sections.append(header + body)
+            return sections
+        sections = make_sections()
+        try:
+            for section in sections:
+                content = section
+                while content:
+                    chunk = content[:1900]
+                    if len(content) > 1900 and "\n" in chunk:
+                        split = chunk.rfind("\n")
+                        chunk = content[:split]
+                        content = content[split+1:]
+                    else:
+                        content = content[len(chunk):]
+                    await ctx.author.send(chunk)
+            await ctx.reply("Sent you the file lists via DM.", mention_author=False)
+        except discord.Forbidden:
+            await ctx.reply("I couldn't DM you. Please enable DMs from server members and try again.", mention_author=False)
 
     return bot
 
