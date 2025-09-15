@@ -236,6 +236,14 @@ def build_bot(cfg: Config) -> commands.Bot:
         )
         await ctx.send(desc)
 
+    async def rescan_callback(category: str):
+        if category == 'book':
+            await ensure_cache_up_to_date(force=True)
+            logger.info("Rescan of book library triggered by upload.")
+        elif category == 'music':
+            await ensure_music_up_to_date(force=True)
+            logger.info("Rescan of music library triggered by upload.")
+
     @bot.command(name="browseall")
     async def browseall_cmd(ctx: commands.Context):
         if not cfg.enable_http_links:
@@ -271,6 +279,10 @@ def build_bot(cfg: Config) -> commands.Bot:
             get_tv=get_tv_local,
             get_music=get_music_local,
             build_links=(link_server.build_links if link_server else None),
+            bot=bot,
+            config=cfg,
+            scanner=scanner,
+            rescan_callback=rescan_callback,
         )
 
     # Slash command providing the same UI, but as an ephemeral message
@@ -322,6 +334,10 @@ def build_bot(cfg: Config) -> commands.Bot:
             get_tv=get_tv_local,
             get_music=get_music_local,
             build_links=(link_server.build_links if link_server else None),
+            bot=bot,
+            config=cfg,
+            scanner=scanner,
+            rescan_callback=rescan_callback,
         )
         await interaction.followup.send(embed=discord.Embed(title="Browse", description="Choose a category."), view=view, ephemeral=True)
 
