@@ -1,6 +1,7 @@
 from typing import Dict, List, Optional, Callable
 
 import discord
+import urllib.parse
 
 
 def chunk(items: List[str], size: int) -> List[List[str]]:
@@ -14,26 +15,10 @@ def build_base_url(http_host: str, http_port: int, public_base_url: Optional[str
     return f"http://{host}:{http_port}"
 
 
-class CategoryButtons(discord.ui.View):
-    def __init__(self, on_select):
-        super().__init__(timeout=300)
-        self.on_select = on_select
-
-    @discord.ui.button(label="Books", style=discord.ButtonStyle.primary)
-    async def books(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.on_select(interaction, 'books')
-
-    @discord.ui.button(label="Movies", style=discord.ButtonStyle.primary)
-    async def movies(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.on_select(interaction, 'movies')
-
-    @discord.ui.button(label="TV", style=discord.ButtonStyle.primary)
-    async def tv(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.on_select(interaction, 'tv')
-
-    @discord.ui.button(label="Music", style=discord.ButtonStyle.primary)
-    async def music(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.on_select(interaction, 'music')
+def _make_button(label: str, style: discord.ButtonStyle, callback):
+    btn = discord.ui.Button(label=label, style=style)
+    btn.callback = callback  # type: ignore
+    return btn
 
 
 class ItemSelect(discord.ui.Select):
@@ -71,10 +56,22 @@ class UnifiedBrowserView(discord.ui.View):
 
     def _show_category_buttons(self):
         self.clear_items()
-        async def on_sel(inter: discord.Interaction, kind: str):
-            self.category = kind
+        async def on_books(inter: discord.Interaction):
+            self.category = 'books'
             await self._show_category(inter)
-        self.add_item(CategoryButtons(on_sel))
+        async def on_movies(inter: discord.Interaction):
+            self.category = 'movies'
+            await self._show_category(inter)
+        async def on_tv(inter: discord.Interaction):
+            self.category = 'tv'
+            await self._show_category(inter)
+        async def on_music(inter: discord.Interaction):
+            self.category = 'music'
+            await self._show_category(inter)
+        self.add_item(_make_button("Books", discord.ButtonStyle.primary, on_books))
+        self.add_item(_make_button("Movies", discord.ButtonStyle.primary, on_movies))
+        self.add_item(_make_button("TV", discord.ButtonStyle.primary, on_tv))
+        self.add_item(_make_button("Music", discord.ButtonStyle.primary, on_music))
 
     async def _show_category(self, interaction: discord.Interaction):
         self.clear_items()
@@ -116,7 +113,7 @@ class UnifiedBrowserView(discord.ui.View):
         if not self.category:
             await interaction.response.send_message("No category selected.", ephemeral=True)
             return
-        url = f"{self.base_url}/links?kind={self.category}&name={discord.utils.escape_markdown(item_name)}"
+        url = f"{self.base_url}/links?kind={self.category}&name={urllib.parse.quote_plus(item_name)}"
         # Offer an "Open Links" button
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label="Open Links", url=url))
