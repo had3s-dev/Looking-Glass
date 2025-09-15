@@ -67,6 +67,7 @@ def build_bot(cfg: Config) -> commands.Bot:
             browse_cmd = app_commands.Command(name="browse", description="Browse Books/Movies/TV/Music and get link pages", callback=browse_slash)
             folders_cmd = app_commands.Command(name="folders", description="(Owner) Export Movies/TV top-level folders as text files", callback=folders_slash)
             list_cmd = app_commands.Command(name="list", description="(Owner) Export full file lists for Movies/TV as text files", callback=list_slash)
+            devbadge_cmd = app_commands.Command(name="devbadge", description="(Owner) Get the link to claim the Active Developer badge", callback=devbadge_slash)
             # Prefer multi-guild list; fallback to single guild_id; else global
             target_guild_ids = cfg.guild_ids or ([cfg.guild_id] if cfg.guild_id else [])
             if target_guild_ids:
@@ -90,6 +91,7 @@ def build_bot(cfg: Config) -> commands.Bot:
                     bot.tree.add_command(browse_cmd, guild=guild_obj)
                     bot.tree.add_command(folders_cmd, guild=guild_obj)
                     bot.tree.add_command(list_cmd, guild=guild_obj)
+                    bot.tree.add_command(devbadge_cmd, guild=guild_obj)
                     synced = await bot.tree.sync(guild=guild_obj)
                     logger.info(f"Slash commands synced for guild {gid}: {[c.name for c in synced]}")
             else:
@@ -98,6 +100,7 @@ def build_bot(cfg: Config) -> commands.Bot:
                 bot.tree.add_command(browse_cmd)
                 bot.tree.add_command(folders_cmd)
                 bot.tree.add_command(list_cmd)
+                bot.tree.add_command(devbadge_cmd)
                 synced = await bot.tree.sync()
                 logger.info(f"Global slash commands synced: {[c.name for c in synced]}")
             _last_sync_ts = _time.time()
@@ -107,6 +110,14 @@ def build_bot(cfg: Config) -> commands.Bot:
     @bot.event
     async def on_ready():
         logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
+        # Set a fun status
+        try:
+            activity = discord.Game(name="in the library | !help")
+            await bot.change_presence(status=discord.Status.online, activity=activity)
+            logger.info("Updated bot presence")
+        except Exception:
+            logger.exception("Failed to set bot presence")
+
         if not background_update.is_running():
             background_update.start()
         await register_slash_commands()
@@ -480,6 +491,24 @@ def build_bot(cfg: Config) -> commands.Bot:
                 else:
                     content = content[len(chunk):]
                 await interaction.followup.send(chunk, ephemeral=True)
+
+    async def devbadge_slash(interaction: discord.Interaction):
+        # Permission check
+        if cfg.owner_user_id is not None and interaction.user.id != cfg.owner_user_id:
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="Active Developer Badge",
+            description=(
+                "To claim your Active Developer Badge, you need to ensure this bot has registered "
+                "at least one application command (like this one!) within the last 30 days.\n\n"
+                "Once you've run a slash command, you can claim your badge here:\n"
+                "https://discord.com/developers/active-developer"
+            ),
+            color=discord.Color.blue()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @bot.command(name="update")
     async def update_cmd(ctx: commands.Context):
