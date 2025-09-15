@@ -4,6 +4,10 @@ import discord
 import urllib.parse
 import asyncio
 
+from discord.ext import commands
+from .config import Config
+from .scanner import SeedboxScanner
+
 
 def chunk(items: List[str], size: int) -> List[List[str]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
@@ -20,6 +24,124 @@ def _make_button(label: str, style: discord.ButtonStyle, callback):
     btn = discord.ui.Button(label=label, style=style)
     btn.callback = callback  # type: ignore
     return btn
+
+
+class UploadModal(discord.ui.Modal):
+    def __init__(self, bot: commands.Bot, config: Config, scanner: SeedboxScanner, rescan_callback: Callable):
+        super().__init__(title="Upload a file")
+        self.bot = bot
+        self.config = config
+        self.scanner = scanner
+        self.rescan_callback = rescan_callback
+
+        self.category_input = discord.ui.TextInput(label='Category', placeholder='Book or Music')
+        self.add_item(self.category_input)
+        self.author_artist_input = discord.ui.TextInput(label='Author/Artist', placeholder='e.g., J.R.R. Tolkien')
+        self.add_item(self.author_artist_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        category = self.category_input.value.strip().lower()
+        author_artist = self.author_artist_input.value.strip()
+
+        if not author_artist:
+            await interaction.response.send_message("Author/Artist cannot be empty.", ephemeral=True)
+            return
+
+        if category not in ('book', 'music'):
+            await interaction.response.send_message("Invalid category. Please enter 'Book' or 'Music'.", ephemeral=True)
+            return
+
+        if category == 'book' and not self.config.library_root_path:
+            await interaction.response.send_message("Book library path is not configured.", ephemeral=True)
+            return
+        if category == 'music' and not self.config.music_root_path:
+            await interaction.response.send_message("Music library path is not configured.", ephemeral=True)
+            return
+
+        dm_channel = None
+        try:
+            # Acknowledge interaction and inform user about DM
+            await interaction.response.send_message("I've sent you a DM to continue the upload process.", ephemeral=True)
+            dm_channel = await interaction.user.create_dm()
+            await dm_channel.send(f"Okay, I'm ready to upload a {category} by {author_artist}. Please upload the file here.")
+
+            def check(m: discord.Message):
+                return m.author.id == interaction.user.id and m.channel.id == dm_channel.id and len(m.attachments) == 1
+
+            message = await self.bot.wait_for('message', check=check, timeout=300.0)
+        except asyncio.TimeoutError:
+            if dm_channel:
+                await dm_channel.send("You took too long to upload the file. Please try again.")
+            return
+        except Exception as e:
+            if dm_channel:
+                await dm_channel.send(f"An error occurred while preparing for the upload: {e}")
+            return
+
+        attachment = message.attachments[0]
+
+        # File validation
+        if category == 'book':
+            allowed_extensions = self.config.file_extensions
+            root_path = self.config.library_root_path
+        else:  # music
+            allowed_extensions = self.config.music_extensions
+            root_path = self.config.music_root_path
+
+        if not any(attachment.filename.lower().endswith(ext) for ext in allowed_extensions):
+            await message.reply(f"Invalid file type. Allowed extensions for {category}s are: {', '.join(allowed_extensions)}")
+            return
+
+        if self.config.max_upload_bytes > 0 and attachment.size > self.config.max_upload_bytes:
+            await message.reply(f"File is too large. Maximum size is {self.config.max_upload_bytes // 1024 // 1024}MB.")
+            return
+
+        # Upload logic
+        await message.add_reaction("⏳")
+
+        try:
+            loop = asyncio.get_running_loop()
+            file_content = await attachment.read()
+
+            def upload_file():
+                import posixpath
+                sftp = self.scanner._connect()
+                try:
+                    if root_path is None: # Should be caught by earlier check, but for type safety
+                        raise ValueError("Root path is not configured.")
+
+                    author_path = posixpath.join(root_path, author_artist)
+                    try:
+                        sftp.stat(author_path)
+                    except FileNotFoundError:
+                        sftp.mkdir(author_path)
+
+                    remote_path = posixpath.join(author_path, attachment.filename)
+                    with sftp.open(remote_path, 'wb') as f:
+                        f.write(file_content)
+                finally:
+                    sftp.close()
+
+            await loop.run_in_executor(None, upload_file)
+
+            try:
+                await message.remove_reaction("⏳", self.bot.user)
+                await message.add_reaction("✅")
+            except discord.HTTPException:
+                pass # Ignore if we can't remove reaction (e.g. permissions)
+
+            await message.reply(f"Successfully uploaded `{attachment.filename}` to the {category} library under `{author_artist}`.")
+
+            # Trigger rescan
+            await self.rescan_callback(category)
+
+        except Exception as e:
+            try:
+                await message.remove_reaction("⏳", self.bot.user)
+                await message.add_reaction("❌")
+            except discord.HTTPException:
+                pass
+            await message.reply(f"An error occurred during upload: {e}")
 
 
 class ItemSelect(discord.ui.Select):
@@ -42,6 +164,10 @@ class UnifiedBrowserView(discord.ui.View):
         get_tv: Callable[[], Dict[str, List[str]]],
         get_music: Callable[[], Dict[str, List[str]]],
         build_links: Optional[Callable[[str, str], List[Tuple[str, str, int]]]] = None,
+        bot: Optional[commands.Bot] = None,
+        config: Optional[Config] = None,
+        scanner: Optional[SeedboxScanner] = None,
+        rescan_callback: Optional[Callable] = None,
     ):
         super().__init__(timeout=600)
         self.base_url = base_url
@@ -51,6 +177,10 @@ class UnifiedBrowserView(discord.ui.View):
         self.get_tv = get_tv
         self.get_music = get_music
         self.build_links = build_links
+        self.bot = bot
+        self.config = config
+        self.scanner = scanner
+        self.rescan_callback = rescan_callback
         self.category: Optional[str] = None
         self.per_page: int = 25
         self.page_index: int = 0
@@ -78,6 +208,11 @@ class UnifiedBrowserView(discord.ui.View):
         self.add_item(_make_button("Movies", discord.ButtonStyle.primary, on_movies))
         self.add_item(_make_button("TV", discord.ButtonStyle.primary, on_tv))
         self.add_item(_make_button("Music", discord.ButtonStyle.primary, on_music))
+        if self.bot and self.config and self.scanner and self.rescan_callback:
+            async def on_upload(interaction: discord.Interaction):
+                modal = UploadModal(self.bot, self.config, self.scanner, self.rescan_callback)
+                await interaction.response.send_modal(modal)
+            self.add_item(_make_button("Upload", discord.ButtonStyle.success, on_upload))
 
     def _rebuild_category_controls(self, title: str, placeholder: str, total: int):
         # Build select for current page and nav buttons
@@ -253,6 +388,18 @@ class UnifiedBrowserView(discord.ui.View):
             await interaction.response.edit_message(embed=self._embed(title, "Pick an artist to get links for tracks."), view=self)
 
     @staticmethod
-    async def send(ctx, base_url: str, page_size: int, get_books_data, get_movies, get_tv, get_music, build_links=None):
-        view = UnifiedBrowserView(base_url, page_size, get_books_data, get_movies, get_tv, get_music, build_links)
+    async def send(ctx, base_url: str, page_size: int, get_books_data, get_movies, get_tv, get_music, build_links=None, bot=None, config=None, scanner=None, rescan_callback=None):
+        view = UnifiedBrowserView(
+            base_url,
+            page_size,
+            get_books_data,
+            get_movies,
+            get_tv,
+            get_music,
+            build_links,
+            bot=bot,
+            config=config,
+            scanner=scanner,
+            rescan_callback=rescan_callback,
+        )
         await ctx.send(embed=discord.Embed(title="Browse", description="Choose a category."), view=view)
