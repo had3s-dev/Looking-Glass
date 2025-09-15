@@ -83,6 +83,20 @@ def build_bot(cfg: Config) -> commands.Bot:
                         bot.tree.add_command(list_cmd, guild=guild_obj)
                     synced = await bot.tree.sync(guild=guild_obj)
                     logger.info(f"Slash commands synced for guild {gid}: {[c.name for c in synced]}")
+                # Ensure no global duplicates remain when using guild-scoped commands
+                try:
+                    global_existing = [c.name for c in bot.tree.get_commands()]
+                    removed_any = False
+                    for name in ("browse", "folders", "list"):
+                        if name in global_existing:
+                            # Remove global command
+                            bot.tree.remove_command(name, type=discord.AppCommandType.chat_input)
+                            removed_any = True
+                    if removed_any:
+                        synced = await bot.tree.sync()
+                        logger.info(f"Removed global commands and re-synced globally: {[c.name for c in synced]}")
+                except Exception:
+                    logger.exception("Failed to remove global commands while using guild-scoped commands")
             else:
                 existing = [c.name for c in bot.tree.get_commands()]
                 if "browse" not in existing:
