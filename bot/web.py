@@ -115,6 +115,26 @@ class LinkServer:
             body.append("</ul>")
         return web.Response(text="\n".join(body), content_type='text/html')
 
+    def build_links(self, kind: str, name: str) -> List[Tuple[str, str, int]]:
+        """
+        Build signed direct-download links for a given kind/name selection.
+        Returns a list of tuples: (filename, url, size_bytes).
+        """
+        # Collect matching files via SFTP based on kind/name
+        files: List[Tuple[str, int]] = []  # (path, size)
+        # Delegate to thread pool not needed here; callers should offload if needed
+        files = self._collect_files_sync(kind, name)
+
+        base = self._base_url()
+        import time
+        exp = int(time.time()) + self.cfg.link_ttl_seconds
+        items: List[Tuple[str, str, int]] = []
+        for path, size in files:
+            token = self.sign_path(path, exp)
+            url = f"{base}/d?token={urllib.parse.quote(token)}"
+            items.append((path.rsplit('/', 1)[-1], url, size))
+        return items
+
     def _collect_files_sync(self, kind: str, name: str) -> List[Tuple[str, int]]:
         import posixpath
         import re

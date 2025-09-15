@@ -214,7 +214,6 @@ def build_bot(cfg: Config) -> commands.Bot:
         desc = (
             "Commands:\n"
             f"{cfg.command_prefix}browseall - Browse Books/Movies/TV/Music and get link pages.\n"
-            f"{cfg.command_prefix}getbook <author> | <book> - Download a book file if downloads are enabled and file is small enough.\n"
             f"{cfg.command_prefix}update - Force an update from the seedbox.\n"
         )
         await ctx.send(desc)
@@ -253,6 +252,7 @@ def build_bot(cfg: Config) -> commands.Bot:
             get_movies=get_movies_local,
             get_tv=get_tv_local,
             get_music=get_music_local,
+            build_links=(link_server.build_links if link_server else None),
         )
 
     # Slash command providing the same UI, but as an ephemeral message
@@ -303,6 +303,7 @@ def build_bot(cfg: Config) -> commands.Bot:
             get_movies=get_movies_local,
             get_tv=get_tv_local,
             get_music=get_music_local,
+            build_links=(link_server.build_links if link_server else None),
         )
         await interaction.followup.send(embed=discord.Embed(title="Browse", description="Choose a category."), view=view, ephemeral=True)
 
@@ -487,61 +488,7 @@ def build_bot(cfg: Config) -> commands.Bot:
             await ctx.send("Update failed. Check logs.")
 
 
-    # ---- Downloads ----
-    @bot.command(name="getbook")
-    async def getbook_cmd(ctx: commands.Context, *, query: str = ""):
-        if not cfg.enable_downloads:
-            await ctx.send("Downloads are disabled.")
-            return
-        if not query or "|" not in query:
-            await ctx.send(f"Usage: {cfg.command_prefix}getbook <author> | <book title>")
-            return
-        author, book = [x.strip() for x in query.split("|", 1)]
-        await ctx.send(f"Searching for '{book}' by '{author}'...")
-        loop = asyncio.get_running_loop()
-        def _find():
-            try:
-                return scanner.find_book_file(author, book)
-            except Exception:
-                logger.exception("find_book_file failed")
-                return None
-        found = await loop.run_in_executor(None, _find)
-        if not found:
-            await ctx.send("Could not locate that book file.")
-            return
-        path, size = found
-        if size > cfg.max_upload_bytes:
-            await ctx.send(f"File is too large to upload ({size} bytes > limit {cfg.max_upload_bytes} bytes).")
-            return
-        # Download and upload
-        def _download_bytes():
-            import paramiko
-            import posixpath as _pp
-            data = b""
-            sftp = None
-            try:
-                sftp = scanner._connect()
-                with sftp.open(path, 'rb') as f:
-                    data = f.read()
-            finally:
-                try:
-                    if sftp:
-                        sftp.close()
-                except Exception:
-                    pass
-            return data, _pp.basename(path)
-        try:
-            data, fname = await loop.run_in_executor(None, _download_bytes)
-        except Exception:
-            logger.exception("Download failed")
-            await ctx.send("Failed to download the file.")
-            return
-        if not data:
-            await ctx.send("Downloaded data is empty.")
-            return
-        fileobj = io.BytesIO(data)
-        fileobj.seek(0)
-        await ctx.send(file=discord.File(fileobj, filename=fname))
+    
 
     # Owner-only prefix fallback: !list (posts in channel): Movies top-level folders and TV shows with seasons
     @bot.command(name="list")

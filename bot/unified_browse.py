@@ -1,7 +1,8 @@
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Tuple
 
 import discord
 import urllib.parse
+import asyncio
 
 
 def chunk(items: List[str], size: int) -> List[List[str]]:
@@ -40,6 +41,7 @@ class UnifiedBrowserView(discord.ui.View):
         get_movies: Callable[[], List[str]],
         get_tv: Callable[[], Dict[str, List[str]]],
         get_music: Callable[[], Dict[str, List[str]]],
+        build_links: Optional[Callable[[str, str], List[Tuple[str, str, int]]]] = None,
     ):
         super().__init__(timeout=600)
         self.base_url = base_url
@@ -48,6 +50,7 @@ class UnifiedBrowserView(discord.ui.View):
         self.get_movies = get_movies
         self.get_tv = get_tv
         self.get_music = get_music
+        self.build_links = build_links
         self.category: Optional[str] = None
         self.per_page: int = 25
         self.page_index: int = 0
@@ -178,10 +181,39 @@ class UnifiedBrowserView(discord.ui.View):
             await interaction.response.send_message("No category selected.", ephemeral=True)
             return
         url = f"{self.base_url}/links?kind={self.category}&name={urllib.parse.quote_plus(item_name)}"
-        # Offer an "Open Links" button
+        # Offer an "Open Links" button regardless, as a fallback
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label="Open Links", url=url))
-        await interaction.response.send_message(f"Links for {self.category.title()}: {item_name}", view=view, ephemeral=True)
+
+        dm_sent = False
+        dm_error = None
+        if self.build_links:
+            # Build links in a thread to avoid blocking the event loop
+            loop = asyncio.get_running_loop()
+            try:
+                items: List[Tuple[str, str, int]] = await loop.run_in_executor(None, lambda: self.build_links(self.category or "", item_name))
+                if items:
+                    # Build a concise DM message
+                    lines: List[str] = []
+                    title = f"Direct download links for {self.category.title()}: {item_name}"
+                    lines.append(title)
+                    for filename, link, size in items[:50]:  # cap to reasonable number
+                        lines.append(f"- {filename} — {link}")
+                    content = "\n".join(lines)
+                    await interaction.user.send(content)
+                    dm_sent = True
+                else:
+                    dm_error = "No files found for that selection."
+            except Exception as e:
+                dm_error = str(e)
+
+        # Respond ephemerally with status and the fallback button
+        if dm_sent:
+            msg = "I've sent you a DM with direct download links. If you don't see it, check your DM privacy settings."
+        else:
+            suffix = f" Reason: {dm_error}" if dm_error else ""
+            msg = f"Couldn't send a DM with direct links.{suffix} You can still open the link page."
+        await interaction.response.send_message(msg, view=view, ephemeral=True)
 
     async def _refresh_category(self, interaction: discord.Interaction):
         # Re-render current category keeping new page index
@@ -221,6 +253,6 @@ class UnifiedBrowserView(discord.ui.View):
             await interaction.response.edit_message(embed=self._embed(title, "Pick an artist to get links for tracks."), view=self)
 
     @staticmethod
-    async def send(ctx, base_url: str, page_size: int, get_books_data, get_movies, get_tv, get_music):
-        view = UnifiedBrowserView(base_url, page_size, get_books_data, get_movies, get_tv, get_music)
+    async def send(ctx, base_url: str, page_size: int, get_books_data, get_movies, get_tv, get_music, build_links=None):
+        view = UnifiedBrowserView(base_url, page_size, get_books_data, get_movies, get_tv, get_music, build_links)
         await ctx.send(embed=discord.Embed(title="Browse", description="Choose a category."), view=view)
