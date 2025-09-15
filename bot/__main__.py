@@ -70,41 +70,34 @@ def build_bot(cfg: Config) -> commands.Bot:
             # Prefer multi-guild list; fallback to single guild_id; else global
             target_guild_ids = cfg.guild_ids or ([cfg.guild_id] if cfg.guild_id else [])
             if target_guild_ids:
+                # First, ensure we wipe any global commands to avoid UI duplicates
+                try:
+                    bot.tree.clear_commands(guild=None)
+                    synced_global = await bot.tree.sync()
+                    logger.info(f"Cleared global commands; now: {[c.name for c in synced_global]}")
+                except Exception:
+                    logger.exception("Failed to clear global commands prior to guild sync")
+
                 for gid in target_guild_ids:
                     if gid is None:
                         continue
                     guild_obj = discord.Object(id=gid)
-                    existing = [c.name for c in bot.tree.get_commands(guild=guild_obj)]
-                    if "browse" not in existing:
-                        bot.tree.add_command(browse_cmd, guild=guild_obj)
-                    if "folders" not in existing:
-                        bot.tree.add_command(folders_cmd, guild=guild_obj)
-                    if "list" not in existing:
-                        bot.tree.add_command(list_cmd, guild=guild_obj)
+                    # Clear guild commands then re-add deterministically
+                    try:
+                        bot.tree.clear_commands(guild=guild_obj)
+                    except Exception:
+                        logger.exception(f"Failed to clear commands for guild {gid}")
+                    bot.tree.add_command(browse_cmd, guild=guild_obj)
+                    bot.tree.add_command(folders_cmd, guild=guild_obj)
+                    bot.tree.add_command(list_cmd, guild=guild_obj)
                     synced = await bot.tree.sync(guild=guild_obj)
                     logger.info(f"Slash commands synced for guild {gid}: {[c.name for c in synced]}")
-                # Ensure no global duplicates remain when using guild-scoped commands
-                try:
-                    global_existing = [c.name for c in bot.tree.get_commands()]
-                    removed_any = False
-                    for name in ("browse", "folders", "list"):
-                        if name in global_existing:
-                            # Remove global command
-                            bot.tree.remove_command(name, type=discord.AppCommandType.chat_input)
-                            removed_any = True
-                    if removed_any:
-                        synced = await bot.tree.sync()
-                        logger.info(f"Removed global commands and re-synced globally: {[c.name for c in synced]}")
-                except Exception:
-                    logger.exception("Failed to remove global commands while using guild-scoped commands")
             else:
-                existing = [c.name for c in bot.tree.get_commands()]
-                if "browse" not in existing:
-                    bot.tree.add_command(browse_cmd)
-                if "folders" not in existing:
-                    bot.tree.add_command(folders_cmd)
-                if "list" not in existing:
-                    bot.tree.add_command(list_cmd)
+                # Global-only mode: clear and re-add globally
+                bot.tree.clear_commands(guild=None)
+                bot.tree.add_command(browse_cmd)
+                bot.tree.add_command(folders_cmd)
+                bot.tree.add_command(list_cmd)
                 synced = await bot.tree.sync()
                 logger.info(f"Global slash commands synced: {[c.name for c in synced]}")
             _last_sync_ts = _time.time()
