@@ -279,26 +279,54 @@ class LinkServer:
 
         loop = asyncio.get_running_loop()
 
-        def read_chunks():
+        queue: asyncio.Queue = asyncio.Queue(maxsize=10)
+        stop_flag = {"stop": False}
+
+        def producer():
             import paramiko
             sftp = None
             try:
                 sftp = self.scanner._connect()
                 with sftp.open(path, 'rb') as f:
-                    while True:
+                    while not stop_flag["stop"]:
                         chunk = f.read(64 * 1024)
                         if not chunk:
                             break
-                        yield chunk
+                        # push to asyncio queue
+                        fut = asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
+                        try:
+                            fut.result()
+                        except Exception:
+                            break
             finally:
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(queue.put(None), loop)  # type: ignore
+                    fut.result(timeout=2)
+                except Exception:
+                    pass
                 try:
                     if sftp:
                         sftp.close()
                 except Exception:
                     pass
 
-        # Write chunks asynchronously
-        for chunk in await loop.run_in_executor(None, lambda: list(read_chunks())):
-            await resp.write(chunk)
-        await resp.write_eof()
+        # Start producer in background thread
+        producer_future = loop.run_in_executor(None, producer)
+
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                try:
+                    await resp.write(chunk)
+                except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
+                    # Client disconnected; stop producer and exit gracefully
+                    stop_flag["stop"] = True
+                    break
+        finally:
+            try:
+                await resp.write_eof()
+            except Exception:
+                pass
         return resp
