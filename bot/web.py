@@ -114,13 +114,24 @@ class LinkServer:
 
     async def handle_upload(self, request: web.Request) -> web.Response:
         reader = await request.multipart()
-        data = {}
-        files = []
+        data: Dict[str, str] = {}
+        # Collect uploaded files as (filename, bytes) to avoid reading from closed streams later
+        files: List[Tuple[str, bytes]] = []
         async for part in reader:
             if part.name == 'files':
-                files.append(part)
+                filename = getattr(part, 'filename', None)
+                if not filename:
+                    # Skip unnamed file parts
+                    _ = await part.read()  # drain
+                    continue
+                # Read the entire file content now; for large files consider chunking in future
+                file_bytes = await part.read()
+                files.append((filename, file_bytes))
             elif part.name:
-                data[part.name] = (await part.read()).decode('utf-8')
+                try:
+                    data[part.name] = (await part.read()).decode('utf-8')
+                except Exception:
+                    data[part.name] = ""
 
         kind = data.get('kind')
         name = data.get('name')
@@ -157,12 +168,9 @@ class LinkServer:
             except FileNotFoundError:
                 sftp.mkdir(dest_path)
 
-            for part in files:
-                filename = part.filename
+            for filename, file_data in files:
                 if not filename:
                     continue
-
-                file_data = await part.read()
 
                 if filename.lower().endswith('.zip'):
                     with io.BytesIO(file_data) as bio:
