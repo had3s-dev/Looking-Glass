@@ -58,7 +58,6 @@ class UploadModal(discord.ui.Modal):
             await interaction.response.send_message("Music library path is not configured.", ephemeral=True)
             return
 
- feature/file-upload-button
         dm_channel = None
         try:
             # Acknowledge interaction and inform user about DM
@@ -77,22 +76,6 @@ class UploadModal(discord.ui.Modal):
         except Exception as e:
             if dm_channel:
                 await dm_channel.send(f"An error occurred while preparing for the upload: {e}")
-
-        try:
-            # Use followup for the message after the modal is dismissed
-            await interaction.response.send_message(f"Okay, I'm ready to upload a {category} by {author_artist}. Please upload the file now.", ephemeral=True)
-
-            def check(m: discord.Message):
-                return m.author.id == interaction.user.id and m.channel.id == interaction.channel.id and len(m.attachments) == 1
-
-            message = await self.bot.wait_for('message', check=check, timeout=300.0)
-        except asyncio.TimeoutError:
-            await interaction.followup.send("You took too long to upload the file. Please try again.", ephemeral=True)
-            return
-        except Exception as e:
-            # This can happen if the bot can't send messages, etc.
-            await interaction.followup.send(f"An error occurred while waiting for your file: {e}", ephemeral=True)
- main
             return
 
         attachment = message.attachments[0]
