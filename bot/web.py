@@ -3,7 +3,10 @@ import base64
 import hmac
 import hashlib
 import html
+import io
+import posixpath
 import urllib.parse
+import zipfile
 from typing import List, Dict, Optional, Tuple
 
 from aiohttp import web
@@ -23,6 +26,8 @@ class LinkServer:
             web.get('/links', self.handle_links),
             web.get('/d', self.handle_download),
             web.get('/', self.handle_root),
+            web.get('/upload', self.handle_upload_form),
+            web.post('/upload', self.handle_upload),
         ])
 
     async def start(self):
@@ -76,6 +81,108 @@ class LinkServer:
             return None
 
     # ---- Routes ----
+    async def handle_upload_form(self, request: web.Request) -> web.Response:
+        content = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Upload Files</title>
+            </head>
+            <body>
+                <h1>Upload Files</h1>
+                <form action="/upload" method="post" enctype="multipart/form-data">
+                    <label for="kind">Kind:</label>
+                    <select name="kind" id="kind">
+                        <option value="books">Books</option>
+                        <option value="movies">Movies</option>
+                        <option value="tv">TV</option>
+                        <option value="music">Music</option>
+                    </select>
+                    <br><br>
+                    <label for="name">Name (Author, Movie Title, etc.):</label>
+                    <input type="text" id="name" name="name" required>
+                    <br><br>
+                    <label for="files">Files:</label>
+                    <input type="file" id="files" name="files" multiple>
+                    <br><br>
+                    <input type="submit" value="Upload">
+                </form>
+            </body>
+            </html>
+        """
+        return web.Response(text=content, content_type='text/html')
+
+    async def handle_upload(self, request: web.Request) -> web.Response:
+        reader = await request.multipart()
+        data = {}
+        files = []
+        async for part in reader:
+            if part.name == 'files':
+                files.append(part)
+            elif part.name:
+                data[part.name] = (await part.read()).decode('utf-8')
+
+        kind = data.get('kind')
+        name = data.get('name')
+
+        if not kind or not name or not files:
+            return web.Response(status=400, text='Missing kind, name, or files.')
+
+        if kind not in ('books', 'movies', 'tv', 'music'):
+            return web.Response(status=400, text='Invalid kind')
+
+        sftp = self.scanner._connect()
+        try:
+            root_path = ''
+            if kind == 'books':
+                root_path = self.scanner.root_path
+            elif kind == 'movies':
+                root_path = self.cfg.movies_root_path or ''
+            elif kind == 'tv':
+                root_path = self.cfg.tv_root_path or ''
+            elif kind == 'music':
+                root_path = self.cfg.music_root_path or ''
+
+            if not root_path:
+                return web.Response(status=500, text=f"Root path for kind '{kind}' is not configured.")
+
+            # Simplified logic to find/create a directory for the upload
+            # For 'books', it might be author name. For others, the name given.
+            # This is a simplification. A real implementation might need more robust logic.
+            dest_dir_name = name
+            dest_path = posixpath.join(root_path, dest_dir_name)
+
+            try:
+                sftp.stat(dest_path)
+            except FileNotFoundError:
+                sftp.mkdir(dest_path)
+
+            for part in files:
+                filename = part.filename
+                if not filename:
+                    continue
+
+                file_data = await part.read()
+
+                if filename.lower().endswith('.zip'):
+                    with io.BytesIO(file_data) as bio:
+                        with zipfile.ZipFile(bio, 'r') as zipf:
+                            for zip_info in zipf.infolist():
+                                if zip_info.is_dir():
+                                    continue
+                                remote_filepath = posixpath.join(dest_path, posixpath.basename(zip_info.filename))
+                                with sftp.open(remote_filepath, 'wb') as f:
+                                    f.write(zipf.read(zip_info.filename))
+                else:
+                    remote_filepath = posixpath.join(dest_path, filename)
+                    with sftp.open(remote_filepath, 'wb') as f:
+                        f.write(file_data)
+
+        finally:
+            sftp.close()
+
+        return web.Response(text="Files uploaded successfully.")
+
     async def handle_root(self, request: web.Request) -> web.Response:
         return web.Response(text="OK", content_type='text/plain')
 
