@@ -29,6 +29,7 @@ class LinkServer:
             web.get('/upload', self.handle_upload_form),
             web.post('/upload', self.handle_upload),
             web.get('/stream', self.handle_stream),
+            web.get('/play', self.handle_play),
         ])
 
     async def start(self):
@@ -272,7 +273,7 @@ class LinkServer:
                 s_exp = now + max(self.cfg.link_ttl_seconds, est * 2 if est > 0 else self.cfg.link_ttl_seconds)
                 stoken = self.sign_path(path, s_exp)
                 self._register_single_use_token(stoken, s_exp)
-                surl = f"{base}/stream?token={urllib.parse.quote(stoken)}"
+                surl = f"{base}/play?token={urllib.parse.quote(stoken)}"
                 stream_items.append((path.rsplit('/', 1)[-1], surl, size))
 
         # Simple HTML
@@ -330,9 +331,58 @@ class LinkServer:
             exp = now + max(self.cfg.link_ttl_seconds, est * 2 if est > 0 else self.cfg.link_ttl_seconds)
             token = self.sign_path(path, exp)
             self._register_single_use_token(token, exp)
-            url = f"{base}/stream?token={urllib.parse.quote(token)}"
+            url = f"{base}/play?token={urllib.parse.quote(token)}"
             out.append((path.rsplit('/', 1)[-1], url, size))
         return out
+
+    async def handle_play(self, request: web.Request) -> web.Response:
+        token = request.query.get('token')
+        if not token:
+            return web.Response(status=400, text='Missing token')
+        path = self.verify_token(token)
+        if not path:
+            return web.Response(status=403, text='Invalid or expired token')
+        filename = path.rsplit('/', 1)[-1]
+        mime = self._guess_mime(filename)
+        base = self._base_url()
+        # We intentionally do NOT consume the token here; /stream will consume it on first response.
+        stream_url = f"{base}/stream?token={urllib.parse.quote(token)}"
+        esc_name = html.escape(filename)
+        esc_stream = html.escape(stream_url)
+        page = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset='utf-8'>
+            <meta name='viewport' content='width=device-width, initial-scale=1'>
+            <title>Play {esc_name}</title>
+            <style>
+                html, body {{ height: 100%; margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif; }}
+                .container {{ display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 12px; }}
+                video {{ width: 100%; height: auto; max-width: 100%; background: #000; }}
+                a.button {{ background: #2d6cdf; color: white; padding: 8px 12px; border-radius: 6px; text-decoration: none; }}
+                .note {{ font-size: 0.9em; color: #aaa; }}
+                .wrap {{ width: min(1200px, 100%); }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="wrap">
+                    <h2>{esc_name}</h2>
+                    <video controls autoplay playsinline preload="metadata">
+                        <source src="{esc_stream}" type="{mime}">
+                        Your browser may not support this media type. You can try the direct link below.
+                    </video>
+                    <div>
+                        <a class="button" href="{esc_stream}">Open direct stream</a>
+                    </div>
+                    <div class="note">This is a single-use link. If playback fails to start, you'll need a new link.</div>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        return web.Response(text=page, content_type='text/html')
 
     def _collect_files_sync(self, kind: str, name: str) -> List[Tuple[str, int]]:
         import posixpath
