@@ -297,12 +297,7 @@ class LinkServer:
                 s_exp = now + max(self.cfg.link_ttl_seconds, est * 2 if est > 0 else self.cfg.link_ttl_seconds)
                 stoken = self.sign_path(path, s_exp)
                 self._register_single_use_token(stoken, s_exp)
-                fname = path.rsplit('/', 1)[-1]
-                # Use /play only for browser-playable formats; else direct /stream link
-                if self._is_browser_playable(fname):
-                    surl = f"{base}/play?token={urllib.parse.quote(stoken)}"
-                else:
-                    surl = f"{base}/stream?token={urllib.parse.quote(stoken)}"
+                surl = f"{base}/play?token={urllib.parse.quote(stoken)}"
                 stream_items.append((path.rsplit('/', 1)[-1], surl, size))
 
         # Simple HTML
@@ -360,11 +355,7 @@ class LinkServer:
             exp = now + max(self.cfg.link_ttl_seconds, est * 2 if est > 0 else self.cfg.link_ttl_seconds)
             token = self.sign_path(path, exp)
             self._register_single_use_token(token, exp)
-            fname = path.rsplit('/', 1)[-1]
-            if self._is_browser_playable(fname):
-                url = f"{base}/play?token={urllib.parse.quote(token)}"
-            else:
-                url = f"{base}/stream?token={urllib.parse.quote(token)}"
+            url = f"{base}/play?token={urllib.parse.quote(token)}"
             out.append((path.rsplit('/', 1)[-1], url, size))
         return out
 
@@ -382,25 +373,6 @@ class LinkServer:
         stream_url = f"{base}/stream?token={urllib.parse.quote(token)}"
         esc_name = html.escape(filename)
         esc_stream = html.escape(stream_url)
-        # If not browser-playable, offer a quick redirect to direct stream
-        if not self._is_browser_playable(filename):
-            page = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset='utf-8'>
-                <meta name='viewport' content='width=device-width, initial-scale=1'>
-                <meta http-equiv='refresh' content='0; URL={esc_stream}'>
-                <title>Open in player: {esc_name}</title>
-                <style> body{{background:#111;color:#eee;font-family:system-ui,sans-serif;padding:24px}} a{{color:#6aa0ff}} </style>
-            </head>
-            <body>
-                <p>This format may not play in the browser. Opening in your default player...</p>
-                <p>If you are not redirected, <a href="{esc_stream}">click here to open the stream</a>.</p>
-            </body>
-            </html>
-            """
-            return web.Response(text=page, content_type='text/html')
         page = f"""
         <!DOCTYPE html>
         <html>
@@ -415,6 +387,7 @@ class LinkServer:
                 a.button {{ background: #2d6cdf; color: white; padding: 8px 12px; border-radius: 6px; text-decoration: none; }}
                 .note {{ font-size: 0.9em; color: #aaa; }}
                 .wrap {{ width: min(1200px, 100%); }}
+                .warn {{ color: #ffcc66; }}
             </style>
         </head>
         <body>
@@ -423,12 +396,13 @@ class LinkServer:
                     <h2>{esc_name}</h2>
                     <video controls autoplay playsinline preload="metadata">
                         <source src="{esc_stream}" type="{mime}">
-                        Your browser may not support this media type. You can try the direct link below.
+                        Your browser may not support this media type. Try the direct link below.
                     </video>
                     <div>
                         <a class="button" href="{esc_stream}">Open direct stream</a>
                     </div>
                     <div class="note">This is a single-use link. If playback fails to start, you'll need a new link.</div>
+                    {('<div class="note warn">This format may not play in your browser. Use the direct link with an external player (e.g., VLC).</div>' if not self._is_browser_playable(filename) else '')}
                 </div>
             </div>
         </body>
