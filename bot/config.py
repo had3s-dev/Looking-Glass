@@ -57,6 +57,10 @@ class Config:
     link_ttl_seconds: int
     link_secret: Optional[str]
 
+    # Transmux/remux (ffmpeg)
+    enable_ffmpeg_remux: bool
+    ffmpeg_path: str
+
 
 def getenv_int(name: str, default: int) -> int:
     v = os.getenv(name)
@@ -154,4 +158,6 @@ def load_config() -> Config:
         public_base_url=os.getenv("PUBLIC_BASE_URL"),
         link_ttl_seconds=getenv_int("LINK_TTL_SECONDS", 900),
         link_secret=os.getenv("LINK_SECRET"),
+        enable_ffmpeg_remux=os.getenv("ENABLE_FFMPEG_REMUX", "false").lower() in ("1", "true", "yes"),
+        ffmpeg_path=os.getenv("FFMPEG_PATH", "ffmpeg"),
     )

@@ -30,6 +30,7 @@ class LinkServer:
             web.post('/upload', self.handle_upload),
             web.get('/stream', self.handle_stream),
             web.get('/play', self.handle_play),
+            web.get('/transmux', self.handle_transmux),
         ])
 
     async def start(self):
@@ -373,6 +374,10 @@ class LinkServer:
         stream_url = f"{base}/stream?token={urllib.parse.quote(token)}"
         esc_name = html.escape(filename)
         esc_stream = html.escape(stream_url)
+        # If the format isn't browser-playable and ffmpeg remux is enabled, use transmux URL
+        if (not self._is_browser_playable(filename)) and self.cfg.enable_ffmpeg_remux:
+            stream_url = f"{base}/transmux?token={urllib.parse.quote(token)}"
+
         page = f"""
         <!DOCTYPE html>
         <html>
@@ -395,7 +400,7 @@ class LinkServer:
                 <div class="wrap">
                     <h2>{esc_name}</h2>
                     <video controls autoplay playsinline preload="metadata">
-                        <source src="{esc_stream}" type="{mime}">
+                        <source src="{html.escape(stream_url)}" type="{('video/mp4' if (not self._is_browser_playable(filename)) and self.cfg.enable_ffmpeg_remux else mime)}">
                         Your browser may not support this media type. Try the direct link below.
                     </video>
                     <div>
@@ -409,6 +414,138 @@ class LinkServer:
         </html>
         """
         return web.Response(text=page, content_type='text/html')
+
+    async def handle_transmux(self, request: web.Request) -> web.StreamResponse:
+        token = request.query.get('token')
+        if not token:
+            return web.Response(status=400, text='Missing token')
+        path = self.verify_token(token)
+        if not path:
+            return web.Response(status=403, text='Invalid or expired token')
+        if not self.cfg.enable_ffmpeg_remux:
+            return web.Response(status=403, text='Remux disabled')
+        if not self._is_token_valid(token):
+            return web.Response(status=403, text='Token already used or invalid.')
+
+        filename = path.rsplit('/', 1)[-1]
+
+        # Prepare response headers for progressive MP4
+        headers = {
+            'Content-Type': 'video/mp4',
+            'Content-Disposition': f"inline; filename*=UTF-8''{urllib.parse.quote(filename.rsplit('.', 1)[0] + '.mp4')}",
+            # We don't know Content-Length ahead of time when transcoding; omit it.
+            'Accept-Ranges': 'none',
+        }
+        resp = web.StreamResponse(status=200, reason='OK', headers=headers)
+        await resp.prepare(request)
+
+        loop = asyncio.get_running_loop()
+
+        # Start ffmpeg subprocess reading from stdin ('-') and writing MP4 to stdout ('-')
+        # Use copy for video if possible; audio to AAC; faststart flags for progressive playback.
+        # Note: On some inputs, copy may fail; a safer default is to transcode video. We start with copy for performance.
+        cmd = [
+            self.cfg.ffmpeg_path,
+            '-hide_banner', '-loglevel', 'error',
+            '-i', 'pipe:0',
+            '-movflags', '+faststart+frag_keyframe+empty_moov',
+            '-c:v', 'copy',
+            '-c:a', 'aac', '-b:a', '192k',
+            '-f', 'mp4',
+            'pipe:1',
+        ]
+
+        # Token consumption will occur after first successful write
+        consumed = {'done': False}
+
+        async def run_ffmpeg():
+            # Launch ffmpeg
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            # Producer: read from SFTP and feed ffmpeg stdin in a thread to avoid blocking
+            stop_flag = {'stop': False}
+
+            def feeder():
+                sftp = None
+                try:
+                    sftp = self.scanner._connect()
+                    with sftp.open(path, 'rb') as f:
+                        while not stop_flag['stop']:
+                            chunk = f.read(128 * 1024)
+                            if not chunk:
+                                break
+                            try:
+                                if proc.stdin is not None:
+                                    proc.stdin.write(chunk)  # type: ignore
+                            except Exception:
+                                break
+                finally:
+                    try:
+                        if proc.stdin:
+                            proc.stdin.close()  # type: ignore
+                    except Exception:
+                        pass
+                    try:
+                        if sftp:
+                            sftp.close()
+                    except Exception:
+                        pass
+
+            feeder_future = loop.run_in_executor(None, feeder)
+
+            try:
+                # Consumer: stream ffmpeg stdout to client
+                assert proc.stdout is not None
+                while True:
+                    chunk = await proc.stdout.read(128 * 1024)
+                    if not chunk:
+                        break
+                    try:
+                        if not consumed['done']:
+                            self._consume_single_use_token(token)
+                            consumed['done'] = True
+                        await resp.write(chunk)
+                    except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
+                        break
+            finally:
+                stop_flag['stop'] = True
+                try:
+                    await feeder_future
+                except Exception:
+                    pass
+                try:
+                    if proc.stdout:
+                        proc.stdout.close()  # type: ignore
+                except Exception:
+                    pass
+                try:
+                    if proc.stderr:
+                        proc.stderr.close()  # type: ignore
+                except Exception:
+                    pass
+                try:
+                    if proc.stdin:
+                        proc.stdin.close()  # type: ignore
+                except Exception:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+
+        try:
+            await run_ffmpeg()
+        finally:
+            try:
+                await resp.write_eof()
+            except Exception:
+                pass
+        return resp
 
     def _collect_files_sync(self, kind: str, name: str) -> List[Tuple[str, int]]:
         import posixpath
