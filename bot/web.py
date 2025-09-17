@@ -28,6 +28,7 @@ class LinkServer:
             web.get('/', self.handle_root),
             web.get('/upload', self.handle_upload_form),
             web.post('/upload', self.handle_upload),
+            web.get('/stream', self.handle_stream),
         ])
 
     async def start(self):
@@ -79,6 +80,50 @@ class LinkServer:
             return path
         except Exception:
             return None
+
+    # ---- Single-use streaming helpers ----
+    _single_use_tokens: Dict[str, int] = {}
+
+    def _register_single_use_token(self, token: str, exp_ts: int) -> None:
+        import time
+        now = int(time.time())
+        # Opportunistic cleanup of expired tokens
+        for k, v in list(self._single_use_tokens.items()):
+            if v < now:
+                self._single_use_tokens.pop(k, None)
+        self._single_use_tokens[token] = exp_ts
+
+    def _consume_single_use_token(self, token: str) -> bool:
+        if token in self._single_use_tokens:
+            self._single_use_tokens.pop(token, None)
+            return True
+        return False
+
+    def _guess_mime(self, filename: str) -> str:
+        lower = filename.lower()
+        if lower.endswith('.mp4') or lower.endswith('.m4v'):
+            return 'video/mp4'
+        if lower.endswith('.webm'):
+            return 'video/webm'
+        if lower.endswith('.mov'):
+            return 'video/quicktime'
+        if lower.endswith('.mkv'):
+            return 'video/x-matroska'
+        if lower.endswith('.mp3'):
+            return 'audio/mpeg'
+        if lower.endswith('.flac'):
+            return 'audio/flac'
+        if lower.endswith('.m4a'):
+            return 'audio/mp4'
+        return 'application/octet-stream'
+
+    def _estimate_duration_seconds(self, size_bytes: int) -> int:
+        # Simple estimate: duration = size / bitrate. Default 6 Mbps.
+        bitrate_bps = 6_000_000
+        try:
+            return max(0, int(size_bytes / max(1, bitrate_bps)))
+        except Exception:
+            return 0
 
     # ---- Routes ----
     async def handle_upload_form(self, request: web.Request) -> web.Response:
@@ -218,6 +263,18 @@ class LinkServer:
             url = f"{base}/d?token={urllib.parse.quote(token)}"
             items.append((path.rsplit('/', 1)[-1], url, size))
 
+        # Build single-use stream links for videos
+        stream_items: List[Tuple[str, str, int]] = []
+        if kind in ('movies', 'tv'):
+            now = int(time.time())
+            for path, size in files:
+                est = self._estimate_duration_seconds(size)
+                s_exp = now + max(self.cfg.link_ttl_seconds, est * 2 if est > 0 else self.cfg.link_ttl_seconds)
+                stoken = self.sign_path(path, s_exp)
+                self._register_single_use_token(stoken, s_exp)
+                surl = f"{base}/stream?token={urllib.parse.quote(stoken)}"
+                stream_items.append((path.rsplit('/', 1)[-1], surl, size))
+
         # Simple HTML
         title = f"Links for {html.escape(name)} ({html.escape(kind)})"
         body = [f"<h1>{title}</h1>"]
@@ -226,6 +283,12 @@ class LinkServer:
         else:
             body.append("<ul>")
             for filename, url, size in items:
+                body.append(f"<li><a href='{html.escape(url)}'>{html.escape(filename)}</a> <small>({size} bytes)</small></li>")
+            body.append("</ul>")
+        if stream_items:
+            body.append("<h2>Stream Now (single-use)</h2>")
+            body.append("<ul>")
+            for filename, url, size in stream_items:
                 body.append(f"<li><a href='{html.escape(url)}'>{html.escape(filename)}</a> <small>({size} bytes)</small></li>")
             body.append("</ul>")
         return web.Response(text="\n".join(body), content_type='text/html')
@@ -249,6 +312,27 @@ class LinkServer:
             url = f"{base}/d?token={urllib.parse.quote(token)}"
             items.append((path.rsplit('/', 1)[-1], url, size))
         return items
+
+    def build_stream_links(self, kind: str, name: str) -> List[Tuple[str, str, int]]:
+        """
+        Build single-use streaming links for Movies/TV selection.
+        Returns a list of tuples: (filename, url, size_bytes).
+        """
+        if kind not in ('movies', 'tv'):
+            return []
+        files: List[Tuple[str, int]] = self._collect_files_sync(kind, name)
+        base = self._base_url()
+        import time
+        now = int(time.time())
+        out: List[Tuple[str, str, int]] = []
+        for path, size in files:
+            est = self._estimate_duration_seconds(size)
+            exp = now + max(self.cfg.link_ttl_seconds, est * 2 if est > 0 else self.cfg.link_ttl_seconds)
+            token = self.sign_path(path, exp)
+            self._register_single_use_token(token, exp)
+            url = f"{base}/stream?token={urllib.parse.quote(token)}"
+            out.append((path.rsplit('/', 1)[-1], url, size))
+        return out
 
     def _collect_files_sync(self, kind: str, name: str) -> List[Tuple[str, int]]:
         import posixpath
@@ -438,6 +522,143 @@ class LinkServer:
                 except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
                     # Client disconnected; stop producer and exit gracefully
                     stop_flag["stop"] = True
+                    break
+        finally:
+            try:
+                await resp.write_eof()
+            except Exception:
+                pass
+        return resp
+
+    async def handle_stream(self, request: web.Request) -> web.StreamResponse:
+        token = request.query.get('token')
+        if not token:
+            return web.Response(status=400, text='Missing token')
+        path = self.verify_token(token)
+        if not path:
+            return web.Response(status=403, text='Invalid or expired token')
+
+        # Enforce single-use
+        if token not in self._single_use_tokens:
+            return web.Response(status=403, text='Token already used or invalid.')
+
+        filename = path.rsplit('/', 1)[-1]
+        mime = self._guess_mime(filename)
+
+        loop = asyncio.get_running_loop()
+
+        # Get file size first
+        def _stat_sync() -> Tuple[int, Optional[Exception]]:
+            sftp = None
+            try:
+                sftp = self.scanner._connect()
+                size = sftp.stat(path).st_size
+                return size, None
+            except Exception as e:
+                return 0, e
+            finally:
+                try:
+                    if sftp:
+                        sftp.close()
+                except Exception:
+                    pass
+
+        size, err = await loop.run_in_executor(None, _stat_sync)
+        if err is not None:
+            return web.Response(status=404, text='File not found')
+
+        # Range handling
+        range_header = request.headers.get('Range')
+        start = 0
+        end = size - 1
+        status = 200
+        headers = {
+            'Content-Type': mime,
+            'Accept-Ranges': 'bytes',
+            'Content-Disposition': f"inline; filename*=UTF-8''{urllib.parse.quote(filename)}",
+        }
+        if range_header and range_header.startswith('bytes='):
+            try:
+                spec = range_header.split('=')[1]
+                s, e = spec.split('-')
+                if s:
+                    start = int(s)
+                if e:
+                    end = int(e)
+                if end >= size:
+                    end = size - 1
+                if start > end:
+                    return web.Response(status=416, text='Requested Range Not Satisfiable')
+                status = 206
+                headers['Content-Range'] = f'bytes {start}-{end}/{size}'
+                headers['Content-Length'] = str(end - start + 1)
+            except Exception:
+                # Malformed range; ignore
+                headers['Content-Length'] = str(size)
+        else:
+            headers['Content-Length'] = str(size)
+
+        resp = web.StreamResponse(status=status, reason='OK', headers=headers)
+        await resp.prepare(request)
+
+        # Mark as consumed once responding starts
+        self._consume_single_use_token(token)
+
+        queue: asyncio.Queue = asyncio.Queue(maxsize=10)
+        stop_flag = {"stop": False}
+
+        def producer_range():
+            sftp = None
+            try:
+                sftp = self.scanner._connect()
+                with sftp.open(path, 'rb') as f:
+                    # Seek to start position
+                    if start > 0:
+                        try:
+                            f.seek(start)
+                        except Exception:
+                            remaining = start
+                            while remaining > 0:
+                                chunk = f.read(min(64 * 1024, remaining))
+                                if not chunk:
+                                    break
+                                remaining -= len(chunk)
+                    pos = start
+                    limit = end
+                    while not stop_flag['stop'] and pos <= limit:
+                        to_read = min(64 * 1024, (limit - pos + 1))
+                        chunk = f.read(to_read)
+                        if not chunk:
+                            break
+                        pos += len(chunk)
+                        fut = asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
+                        try:
+                            fut.result()
+                        except Exception:
+                            break
+            finally:
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(queue.put(None), loop)  # type: ignore
+                    fut.result(timeout=2)
+                except Exception:
+                    pass
+                try:
+                    if sftp:
+                        sftp.close()
+                except Exception:
+                    pass
+
+        _ = loop.run_in_executor(None, producer_range)
+
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                try:
+                    await resp.write(chunk)
+                except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
+                    stop_flag['stop'] = True
                     break
         finally:
             try:
