@@ -83,22 +83,42 @@ class LinkServer:
             return None
 
     # ---- Single-use streaming helpers ----
-    _single_use_tokens: Dict[str, int] = {}
+    # token -> {"exp": int, "uses": int}
+    _single_use_tokens: Dict[str, Dict[str, int]] = {}
 
-    def _register_single_use_token(self, token: str, exp_ts: int) -> None:
+    def _register_single_use_token(self, token: str, exp_ts: int, max_uses: int = 4) -> None:
         import time
         now = int(time.time())
         # Opportunistic cleanup of expired tokens
         for k, v in list(self._single_use_tokens.items()):
-            if v < now:
+            if v.get("exp", 0) < now:
                 self._single_use_tokens.pop(k, None)
-        self._single_use_tokens[token] = exp_ts
+        self._single_use_tokens[token] = {"exp": exp_ts, "uses": max(1, max_uses)}
 
     def _consume_single_use_token(self, token: str) -> bool:
-        if token in self._single_use_tokens:
+        # Decrement usage; remove when reaches zero
+        rec = self._single_use_tokens.get(token)
+        if not rec:
+            return False
+        rec["uses"] = max(0, rec.get("uses", 1) - 1)
+        if rec["uses"] <= 0:
             self._single_use_tokens.pop(token, None)
-            return True
-        return False
+        else:
+            self._single_use_tokens[token] = rec
+        return True
+
+    def _is_token_valid(self, token: str) -> bool:
+        import time
+        rec = self._single_use_tokens.get(token)
+        if not rec:
+            return False
+        if rec.get("exp", 0) < int(time.time()):
+            # expired
+            self._single_use_tokens.pop(token, None)
+            return False
+        if rec.get("uses", 0) <= 0:
+            return False
+        return True
 
     def _guess_mime(self, filename: str) -> str:
         lower = filename.lower()
@@ -117,6 +137,10 @@ class LinkServer:
         if lower.endswith('.m4a'):
             return 'audio/mp4'
         return 'application/octet-stream'
+
+    def _is_browser_playable(self, filename: str) -> bool:
+        lower = filename.lower()
+        return lower.endswith('.mp4') or lower.endswith('.m4v') or lower.endswith('.webm') or lower.endswith('.mov')
 
     def _estimate_duration_seconds(self, size_bytes: int) -> int:
         # Simple estimate: duration = size / bitrate. Default 6 Mbps.
@@ -273,7 +297,12 @@ class LinkServer:
                 s_exp = now + max(self.cfg.link_ttl_seconds, est * 2 if est > 0 else self.cfg.link_ttl_seconds)
                 stoken = self.sign_path(path, s_exp)
                 self._register_single_use_token(stoken, s_exp)
-                surl = f"{base}/play?token={urllib.parse.quote(stoken)}"
+                fname = path.rsplit('/', 1)[-1]
+                # Use /play only for browser-playable formats; else direct /stream link
+                if self._is_browser_playable(fname):
+                    surl = f"{base}/play?token={urllib.parse.quote(stoken)}"
+                else:
+                    surl = f"{base}/stream?token={urllib.parse.quote(stoken)}"
                 stream_items.append((path.rsplit('/', 1)[-1], surl, size))
 
         # Simple HTML
@@ -331,7 +360,11 @@ class LinkServer:
             exp = now + max(self.cfg.link_ttl_seconds, est * 2 if est > 0 else self.cfg.link_ttl_seconds)
             token = self.sign_path(path, exp)
             self._register_single_use_token(token, exp)
-            url = f"{base}/play?token={urllib.parse.quote(token)}"
+            fname = path.rsplit('/', 1)[-1]
+            if self._is_browser_playable(fname):
+                url = f"{base}/play?token={urllib.parse.quote(token)}"
+            else:
+                url = f"{base}/stream?token={urllib.parse.quote(token)}"
             out.append((path.rsplit('/', 1)[-1], url, size))
         return out
 
@@ -349,6 +382,25 @@ class LinkServer:
         stream_url = f"{base}/stream?token={urllib.parse.quote(token)}"
         esc_name = html.escape(filename)
         esc_stream = html.escape(stream_url)
+        # If not browser-playable, offer a quick redirect to direct stream
+        if not self._is_browser_playable(filename):
+            page = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset='utf-8'>
+                <meta name='viewport' content='width=device-width, initial-scale=1'>
+                <meta http-equiv='refresh' content='0; URL={esc_stream}'>
+                <title>Open in player: {esc_name}</title>
+                <style> body{{background:#111;color:#eee;font-family:system-ui,sans-serif;padding:24px}} a{{color:#6aa0ff}} </style>
+            </head>
+            <body>
+                <p>This format may not play in the browser. Opening in your default player...</p>
+                <p>If you are not redirected, <a href="{esc_stream}">click here to open the stream</a>.</p>
+            </body>
+            </html>
+            """
+            return web.Response(text=page, content_type='text/html')
         page = f"""
         <!DOCTYPE html>
         <html>
@@ -588,8 +640,8 @@ class LinkServer:
         if not path:
             return web.Response(status=403, text='Invalid or expired token')
 
-        # Enforce single-use
-        if token not in self._single_use_tokens:
+        # Enforce token validity (not expired and has remaining uses)
+        if not self._is_token_valid(token):
             return web.Response(status=403, text='Token already used or invalid.')
 
         filename = path.rsplit('/', 1)[-1]
@@ -651,8 +703,13 @@ class LinkServer:
         resp = web.StreamResponse(status=status, reason='OK', headers=headers)
         await resp.prepare(request)
 
-        # Mark as consumed once responding starts
-        self._consume_single_use_token(token)
+        # For HEAD requests, do not stream body and do not consume the token
+        if request.method.upper() == 'HEAD':
+            try:
+                await resp.write_eof()
+            except Exception:
+                pass
+            return resp
 
         queue: asyncio.Queue = asyncio.Queue(maxsize=10)
         stop_flag = {"stop": False}
@@ -706,6 +763,10 @@ class LinkServer:
                 if chunk is None:
                     break
                 try:
+                    # Consume a token use on first successful write
+                    if stop_flag['stop'] is False and queue.qsize() == 0:
+                        # consume once per response
+                        self._consume_single_use_token(token)
                     await resp.write(chunk)
                 except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
                     stop_flag['stop'] = True
