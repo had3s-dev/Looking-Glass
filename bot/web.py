@@ -224,16 +224,38 @@ class LinkServer:
             items.append((path.rsplit('/', 1)[-1], url, size))
 
 
+        # Build video player links for movies and TV
+        video_items: List[Tuple[str, str, int]] = []
+        if kind in ('movies', 'tv') and self.cfg.enable_video_player:
+            try:
+                video_items = self.build_video_links(kind, name)
+            except Exception:
+                video_items = []
+
         # Simple HTML
         title = f"Links for {html.escape(name)} ({html.escape(kind)})"
         body = [f"<h1>{title}</h1>"]
-        if not items:
+        
+        if not items and not video_items:
             body.append("<p>No files found.</p>")
         else:
-            body.append("<ul>")
-            for filename, url, size in items:
-                body.append(f"<li><a href='{html.escape(url)}'>{html.escape(filename)}</a> <small>({size} bytes)</small></li>")
-            body.append("</ul>")
+            # Video player links for movies and TV
+            if video_items:
+                body.append("<h2>🎬 Watch Online</h2>")
+                body.append("<ul>")
+                for filename, url, size in video_items:
+                    body.append(f"<li><a href='{html.escape(url)}' target='_blank'>{html.escape(filename)}</a> <small>({size} bytes)</small></li>")
+                body.append("</ul>")
+            
+            # Direct download links
+            if items:
+                if video_items:
+                    body.append("<h2>📁 Direct Downloads</h2>")
+                body.append("<ul>")
+                for filename, url, size in items:
+                    body.append(f"<li><a href='{html.escape(url)}'>{html.escape(filename)}</a> <small>({size} bytes)</small></li>")
+                body.append("</ul>")
+        
         return web.Response(text="\n".join(body), content_type='text/html')
 
     def build_links(self, kind: str, name: str) -> List[Tuple[str, str, int]]:
