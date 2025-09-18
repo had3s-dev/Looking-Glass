@@ -32,6 +32,7 @@ class LinkServer:
             web.get('/video', self.handle_video_player),
             web.get('/stream', self.handle_video_stream),
             web.get('/info', self.handle_video_info),
+            web.get('/subtitle', self.handle_subtitle),
             web.get('/test-video', self.handle_test_video),
         ])
 
@@ -532,6 +533,66 @@ class LinkServer:
         # But we'll try direct streaming first if FFmpeg is not available
         return lower.endswith('.mkv') or lower.endswith('.avi')
     
+    def _find_subtitle_files(self, video_path: str) -> List[Dict[str, str]]:
+        """Find subtitle files for a video"""
+        import os
+        video_dir = os.path.dirname(video_path)
+        video_name = os.path.splitext(os.path.basename(video_path))[0]
+        
+        subtitle_files = []
+        subtitle_extensions = ['.srt', '.vtt', '.ass', '.ssa']
+        
+        for ext in subtitle_extensions:
+            subtitle_path = os.path.join(video_dir, f"{video_name}{ext}")
+            if os.path.exists(subtitle_path):
+                # Determine language from filename or default to 'en'
+                lang = 'en'
+                if '.en.' in subtitle_path:
+                    lang = 'en'
+                elif '.es.' in subtitle_path:
+                    lang = 'es'
+                elif '.fr.' in subtitle_path:
+                    lang = 'fr'
+                elif '.de.' in subtitle_path:
+                    lang = 'de'
+                elif '.it.' in subtitle_path:
+                    lang = 'it'
+                elif '.pt.' in subtitle_path:
+                    lang = 'pt'
+                elif '.ru.' in subtitle_path:
+                    lang = 'ru'
+                elif '.ja.' in subtitle_path:
+                    lang = 'ja'
+                elif '.ko.' in subtitle_path:
+                    lang = 'ko'
+                elif '.zh.' in subtitle_path:
+                    lang = 'zh'
+                
+                subtitle_files.append({
+                    'path': subtitle_path,
+                    'language': lang,
+                    'label': f"Subtitle ({lang.upper()})",
+                    'extension': ext
+                })
+        
+        return subtitle_files
+    
+    def _generate_subtitle_tracks(self, subtitle_files: List[Dict[str, str]], token: str, base_url: str) -> str:
+        """Generate HTML for subtitle tracks"""
+        if not subtitle_files:
+            return ""
+        
+        tracks_html = []
+        for i, subtitle_file in enumerate(subtitle_files):
+            subtitle_url = f"{base_url}/subtitle?token={urllib.parse.quote(token)}&lang={subtitle_file['language']}"
+            tracks_html.append(
+                f'<track kind="subtitles" src="{html.escape(subtitle_url)}" '
+                f'srclang="{subtitle_file["language"]}" label="{html.escape(subtitle_file["label"])}" '
+                f'{"default" if i == 0 else ""}>'
+            )
+        
+        return '\n                        '.join(tracks_html)
+    
     async def handle_video_player(self, request: web.Request) -> web.Response:
         """Serve the video player HTML page using Video.js"""
         token = request.query.get('token')
@@ -548,6 +609,9 @@ class LinkServer:
         
         base_url = self._base_url()
         stream_url = f"{base_url}/stream?token={urllib.parse.quote(token)}"
+        
+        # Find subtitle files
+        subtitle_files = self._find_subtitle_files(path)
         
         # Video.js player HTML - much more reliable than custom implementation
         html_content = f"""
@@ -611,24 +675,6 @@ class LinkServer:
                     background: rgba(0,0,0,0.9);
                 }}
                 
-                .debug-btn {{
-                    position: absolute;
-                    top: 20px;
-                    right: 140px;
-                    background: rgba(0,0,0,0.8);
-                    color: white;
-                    border: 1px solid #555;
-                    padding: 10px 20px;
-                    border-radius: 5px;
-                    text-decoration: none;
-                    font-size: 14px;
-                    transition: background 0.2s ease;
-                    z-index: 1000;
-                }}
-                
-                .debug-btn:hover {{
-                    background: rgba(0,0,0,0.9);
-                }}
                 
                 .loading {{
                     position: absolute;
@@ -651,6 +697,7 @@ class LinkServer:
                         preload="auto"
                         data-setup='{{}}'>
                         <source src="{html.escape(stream_url)}" type="{self._get_video_mime_type(filename)}">
+                        {self._generate_subtitle_tracks(subtitle_files, token, base_url)}
                         <p class="vjs-no-js">
                             To view this video please enable JavaScript, and consider upgrading to a web browser that
                             <a href="https://videojs.com/html5-video-support/" target="_blank">supports HTML5 video</a>.
@@ -660,7 +707,6 @@ class LinkServer:
                 </div>
                 
                 <a href="{base_url}/d?token={urllib.parse.quote(token)}" class="download-btn">Download</a>
-                <a href="{base_url}/test-video?token={urllib.parse.quote(token)}" class="debug-btn">Debug</a>
             </div>
             
             <!-- Video.js JavaScript -->
@@ -677,11 +723,14 @@ class LinkServer:
                         }},
                         nativeVideoTracks: false,
                         nativeAudioTracks: false,
-                        nativeTextTracks: false
+                        nativeTextTracks: true  // Enable native text tracks for subtitles
                     }},
                     playbackRates: [0.5, 1, 1.25, 1.5, 2],
                     controls: true,
-                    preload: 'auto'
+                    preload: 'auto',
+                    textTrackSettings: {{
+                        persistTextTrackSettings: false
+                    }}
                 }});
                 
                 const loading = document.getElementById('loading');
@@ -691,6 +740,7 @@ class LinkServer:
                     console.log('Video.js player is ready');
                     console.log('Stream URL:', '{html.escape(stream_url)}');
                     console.log('MIME type:', '{self._get_video_mime_type(filename)}');
+                    console.log('Subtitle files found:', {len(subtitle_files)});
                     loading.style.display = 'none';
                 }});
                 
@@ -776,6 +826,104 @@ class LinkServer:
         """
         
         return web.Response(text=html_content, content_type='text/html')
+    
+    async def handle_subtitle(self, request: web.Request) -> web.Response:
+        """Serve subtitle files"""
+        token = request.query.get('token')
+        if not token:
+            return web.Response(status=400, text='Missing token')
+        
+        path = self.verify_token(token)
+        if not path:
+            return web.Response(status=403, text='Invalid or expired token')
+        
+        # Find subtitle files for this video
+        subtitle_files = self._find_subtitle_files(path)
+        
+        if not subtitle_files:
+            return web.Response(status=404, text='No subtitle files found')
+        
+        # Get requested language or default to first available
+        requested_lang = request.query.get('lang', 'en')
+        subtitle_file = None
+        
+        # Try to find subtitle in requested language
+        for sub in subtitle_files:
+            if sub['language'] == requested_lang:
+                subtitle_file = sub
+                break
+        
+        # Fallback to first available subtitle
+        if not subtitle_file:
+            subtitle_file = subtitle_files[0]
+        
+        # Read and serve the subtitle file
+        try:
+            with open(subtitle_file['path'], 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Convert SRT to VTT if needed
+            if subtitle_file['extension'] == '.srt':
+                content = self._convert_srt_to_vtt(content)
+                content_type = 'text/vtt'
+            elif subtitle_file['extension'] == '.vtt':
+                content_type = 'text/vtt'
+            elif subtitle_file['extension'] in ['.ass', '.ssa']:
+                content_type = 'text/plain'
+            else:
+                content_type = 'text/plain'
+            
+            return web.Response(
+                text=content,
+                content_type=content_type,
+                headers={
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET',
+                    'Access-Control-Allow-Headers': 'Range'
+                }
+            )
+        except Exception as e:
+            return web.Response(status=500, text=f'Error reading subtitle file: {str(e)}')
+    
+    def _convert_srt_to_vtt(self, srt_content: str) -> str:
+        """Convert SRT subtitle format to VTT format"""
+        lines = srt_content.strip().split('\n')
+        vtt_lines = ['WEBVTT', '']
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            # Skip empty lines
+            if not line:
+                i += 1
+                continue
+            
+            # Skip subtitle number
+            if line.isdigit():
+                i += 1
+                continue
+            
+            # Process time line
+            if '-->' in line:
+                # Convert SRT time format to VTT format
+                time_line = line.replace(',', '.')
+                vtt_lines.append(time_line)
+                i += 1
+                
+                # Add subtitle text
+                subtitle_text = []
+                while i < len(lines) and lines[i].strip():
+                    subtitle_text.append(lines[i].strip())
+                    i += 1
+                
+                if subtitle_text:
+                    vtt_lines.append(' '.join(subtitle_text))
+                    vtt_lines.append('')
+            else:
+                i += 1
+        
+        return '\n'.join(vtt_lines)
     
     async def handle_video_info(self, request: web.Request) -> web.Response:
         """Get video file information for the player"""
