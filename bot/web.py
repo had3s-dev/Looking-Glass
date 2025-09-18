@@ -5,6 +5,7 @@ import hashlib
 import html
 import io
 import posixpath
+import time
 import urllib.parse
 import zipfile
 from typing import List, Dict, Optional, Tuple
@@ -821,6 +822,23 @@ class LinkServer:
                 
                 video.addEventListener('loadeddata', () => {{
                     loading.style.display = 'none';
+                    console.log('Video loaded successfully');
+                }});
+                
+                video.addEventListener('loadstart', () => {{
+                    console.log('Video load started');
+                }});
+                
+                video.addEventListener('canplay', () => {{
+                    console.log('Video can start playing');
+                }});
+                
+                video.addEventListener('waiting', () => {{
+                    console.log('Video is waiting for data');
+                }});
+                
+                video.addEventListener('stalled', () => {{
+                    console.log('Video stalled - no data received');
                 }});
                 
                 // Keyboard shortcuts
@@ -981,6 +999,9 @@ class LinkServer:
             'Cache-Control': 'public, max-age=3600',
             'X-Content-Type-Options': 'nosniff',
         }
+        
+        print(f"Streaming {filename} with MIME type: {mime_type}")
+        print(f"Needs transcoding: {self._needs_transcoding(filename)}")
         
         if range_header and range_header.startswith('bytes='):
             try:
@@ -1277,22 +1298,51 @@ class LinkServer:
             stderr_task = asyncio.create_task(stderr_reader())
             
             try:
-                # Consumer: stream FFmpeg output to client
+                # Consumer: stream FFmpeg output to client with timeout
                 if proc.stdout is not None:
                     first_chunk = True
+                    chunk_count = 0
+                    total_bytes = 0
+                    last_activity = time.time()
+                    
                     while True:
-                        chunk = await proc.stdout.read(128 * 1024)  # Larger output chunks
-                        if not chunk:
-                            print("FFmpeg output ended")
-                            break
-                        if first_chunk:
-                            print(f"First chunk received: {len(chunk)} bytes")
-                            first_chunk = False
                         try:
-                            await resp.write(chunk)
-                        except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
+                            # Add timeout to prevent hanging
+                            chunk = await asyncio.wait_for(proc.stdout.read(128 * 1024), timeout=30.0)
+                            if not chunk:
+                                print("FFmpeg output ended")
+                                break
+                            
+                            if first_chunk:
+                                print(f"First chunk received: {len(chunk)} bytes")
+                                first_chunk = False
+                            
+                            chunk_count += 1
+                            total_bytes += len(chunk)
+                            last_activity = time.time()
+                            
+                            if chunk_count % 10 == 0:
+                                print(f"Output {chunk_count} chunks, {total_bytes} bytes total")
+                            
+                            try:
+                                await resp.write(chunk)
+                                await resp.drain()  # Ensure data is sent
+                            except (ConnectionResetError, asyncio.CancelledError, RuntimeError) as e:
+                                print(f"Connection lost during streaming: {e}")
+                                stop_flag['stop'] = True
+                                break
+                                
+                        except asyncio.TimeoutError:
+                            print("Timeout waiting for FFmpeg output")
                             stop_flag['stop'] = True
                             break
+                        except Exception as e:
+                            print(f"Error reading from FFmpeg: {e}")
+                            break
+                    
+                    print(f"Streaming completed: {chunk_count} chunks, {total_bytes} bytes total")
+                else:
+                    print("No stdout from FFmpeg")
             except Exception as e:
                 print(f"Consumer error: {e}")
             finally:
