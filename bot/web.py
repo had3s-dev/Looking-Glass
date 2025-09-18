@@ -512,7 +512,7 @@ class LinkServer:
         return any(filename.lower().endswith(ext) for ext in video_extensions)
     
     def _get_video_mime_type(self, filename: str) -> str:
-        """Get MIME type for video file"""
+        """Get MIME type for video file - returns MP4 for transcoded files"""
         lower = filename.lower()
         if lower.endswith('.mp4') or lower.endswith('.m4v'):
             return 'video/mp4'
@@ -520,10 +520,9 @@ class LinkServer:
             return 'video/webm'
         elif lower.endswith('.mov'):
             return 'video/quicktime'
-        elif lower.endswith('.mkv'):
-            return 'video/x-matroska'
-        elif lower.endswith('.avi'):
-            return 'video/x-msvideo'
+        elif lower.endswith('.mkv') or lower.endswith('.avi'):
+            # MKV and AVI files are transcoded to MP4, so return MP4 MIME type
+            return 'video/mp4'
         return 'video/mp4'  # Default fallback
     
     def _needs_transcoding(self, filename: str) -> bool:
@@ -690,6 +689,8 @@ class LinkServer:
                 // Event listeners for debugging
                 player.ready(() => {{
                     console.log('Video.js player is ready');
+                    console.log('Stream URL:', '{html.escape(stream_url)}');
+                    console.log('MIME type:', '{self._get_video_mime_type(filename)}');
                     loading.style.display = 'none';
                 }});
                 
@@ -716,7 +717,19 @@ class LinkServer:
                 
                 player.on('error', (e) => {{
                     console.error('Video player error:', e);
+                    console.log('Error details:', player.error());
                     loading.style.display = 'none';
+                    
+                    // Test if the stream URL is accessible
+                    fetch('{html.escape(stream_url)}', {{ method: 'HEAD' }})
+                        .then(response => {{
+                            console.log('Stream URL response:', response.status, response.statusText);
+                            console.log('Content-Type:', response.headers.get('content-type'));
+                        }})
+                        .catch(err => {{
+                            console.error('Stream URL fetch error:', err);
+                        }});
+                    
                     player.error({{
                         code: 4,
                         message: 'Error loading video. Please try downloading the file instead.'
@@ -819,16 +832,21 @@ class LinkServer:
             return web.Response(status=400, text='File is not a supported video format')
         
         # Check if we need transcoding for browser compatibility
-        if self._needs_transcoding(filename) and self.cfg.enable_video_player:
+        needs_transcoding = self._needs_transcoding(filename)
+        print(f"Stream request for {filename}: needs_transcoding={needs_transcoding}, video_player_enabled={self.cfg.enable_video_player}")
+        
+        if needs_transcoding and self.cfg.enable_video_player:
             # Check if FFmpeg is available
             ffmpeg_path = await self._find_ffmpeg()
+            print(f"FFmpeg path: {ffmpeg_path}")
             if ffmpeg_path:
+                print(f"Using transcoding for {filename}")
                 return await self._stream_with_transcoding(path, filename, request)
             else:
-                print("FFmpeg not available, trying direct streaming for MKV/AVI")
-                # Fallback to direct streaming - some browsers can handle MKV
-                return await self._stream_direct(path, filename, request)
+                print("FFmpeg not available for MKV/AVI transcoding")
+                return web.Response(status=503, text='Video transcoding not available. Please download the file instead.')
         else:
+            print(f"Using direct streaming for {filename}")
             return await self._stream_direct(path, filename, request)
     
     async def _stream_direct(self, path: str, filename: str, request: web.Request) -> web.StreamResponse:
@@ -872,6 +890,7 @@ class LinkServer:
         
         print(f"Streaming {filename} with MIME type: {mime_type}")
         print(f"Needs transcoding: {self._needs_transcoding(filename)}")
+        print(f"Video player enabled: {self.cfg.enable_video_player}")
         
         if range_header and range_header.startswith('bytes='):
             try:
