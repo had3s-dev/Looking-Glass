@@ -534,7 +534,7 @@ class LinkServer:
         return lower.endswith('.mkv') or lower.endswith('.avi')
     
     async def handle_video_player(self, request: web.Request) -> web.Response:
-        """Serve the video player HTML page"""
+        """Serve the video player HTML page using Video.js"""
         token = request.query.get('token')
         if not token:
             return web.Response(status=400, text='Missing token')
@@ -549,9 +549,8 @@ class LinkServer:
         
         base_url = self._base_url()
         stream_url = f"{base_url}/stream?token={urllib.parse.quote(token)}"
-        info_url = f"{base_url}/info?token={urllib.parse.quote(token)}"
         
-        # Modern video player HTML with better UX
+        # Video.js player HTML - much more reliable than custom implementation
         html_content = f"""
         <!DOCTYPE html>
         <html lang="en">
@@ -559,6 +558,9 @@ class LinkServer:
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>Playing: {html.escape(filename)}</title>
+            
+            <!-- Video.js CSS -->
+            <link href="https://vjs.zencdn.net/8.6.1/video-js.css" rel="stylesheet">
             <style>
                 * {{
                     margin: 0;
@@ -567,14 +569,13 @@ class LinkServer:
                 }}
                 
                 body {{
-                    background: #0a0a0a;
-                    color: #ffffff;
+                    background: #000;
+                    color: #fff;
                     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                     overflow: hidden;
                 }}
                 
                 .player-container {{
-                    position: relative;
                     width: 100vw;
                     height: 100vh;
                     display: flex;
@@ -584,128 +585,19 @@ class LinkServer:
                 
                 .video-wrapper {{
                     flex: 1;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
                     position: relative;
                 }}
                 
-                video {{
-                    width: 100%;
-                    height: 100%;
-                    object-fit: contain;
-                    background: #000;
-                }}
-                
-                .controls {{
-                    position: absolute;
-                    bottom: 0;
-                    left: 0;
-                    right: 0;
-                    background: linear-gradient(transparent, rgba(0,0,0,0.8));
-                    padding: 20px;
-                    display: flex;
-                    align-items: center;
-                    gap: 15px;
-                    opacity: 0;
-                    transition: opacity 0.3s ease;
-                }}
-                
-                .player-container:hover .controls {{
-                    opacity: 1;
-                }}
-                
-                .play-pause {{
-                    background: #ff6b6b;
-                    border: none;
-                    color: white;
-                    width: 50px;
-                    height: 50px;
-                    border-radius: 50%;
-                    font-size: 18px;
-                    cursor: pointer;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    transition: background 0.2s ease;
-                }}
-                
-                .play-pause:hover {{
-                    background: #ff5252;
-                }}
-                
-                .progress-container {{
-                    flex: 1;
-                    height: 6px;
-                    background: rgba(255,255,255,0.3);
-                    border-radius: 3px;
-                    cursor: pointer;
-                    position: relative;
-                }}
-                
-                .progress-bar {{
-                    height: 100%;
-                    background: #ff6b6b;
-                    border-radius: 3px;
-                    width: 0%;
-                    transition: width 0.1s ease;
-                }}
-                
-                .time-display {{
-                    color: #ccc;
-                    font-size: 14px;
-                    min-width: 100px;
-                    text-align: center;
-                }}
-                
-                .volume-container {{
-                    display: flex;
-                    align-items: center;
-                    gap: 10px;
-                }}
-                
-                .volume-slider {{
-                    width: 80px;
-                    height: 4px;
-                    background: rgba(255,255,255,0.3);
-                    border-radius: 2px;
-                    outline: none;
-                    cursor: pointer;
-                }}
-                
-                .fullscreen {{
-                    background: none;
-                    border: none;
-                    color: #ccc;
-                    font-size: 20px;
-                    cursor: pointer;
-                    padding: 5px;
-                }}
-                
-                .loading {{
-                    position: absolute;
-                    top: 50%;
-                    left: 50%;
-                    transform: translate(-50%, -50%);
-                    color: #ccc;
-                    font-size: 16px;
-                }}
-                
-                .error {{
-                    position: absolute;
-                    top: 50%;
-                    left: 50%;
-                    transform: translate(-50%, -50%);
-                    color: #ff6b6b;
-                    text-align: center;
-                    max-width: 400px;
+                .video-js {{
+                    width: 100% !important;
+                    height: 100% !important;
                 }}
                 
                 .download-btn {{
                     position: absolute;
                     top: 20px;
                     right: 20px;
-                    background: rgba(0,0,0,0.7);
+                    background: rgba(0,0,0,0.8);
                     color: white;
                     border: 1px solid #555;
                     padding: 10px 20px;
@@ -713,132 +605,130 @@ class LinkServer:
                     text-decoration: none;
                     font-size: 14px;
                     transition: background 0.2s ease;
+                    z-index: 1000;
                 }}
                 
                 .download-btn:hover {{
                     background: rgba(0,0,0,0.9);
+                }}
+                
+                .debug-btn {{
+                    position: absolute;
+                    top: 20px;
+                    right: 140px;
+                    background: rgba(0,0,0,0.8);
+                    color: white;
+                    border: 1px solid #555;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    text-decoration: none;
+                    font-size: 14px;
+                    transition: background 0.2s ease;
+                    z-index: 1000;
+                }}
+                
+                .debug-btn:hover {{
+                    background: rgba(0,0,0,0.9);
+                }}
+                
+                .loading {{
+                    position: absolute;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    color: #fff;
+                    font-size: 18px;
+                    z-index: 100;
                 }}
             </style>
         </head>
         <body>
             <div class="player-container">
                 <div class="video-wrapper">
-                    <video id="videoPlayer" preload="metadata" controls>
+                    <video-js
+                        id="videoPlayer"
+                        class="vjs-default-skin"
+                        controls
+                        preload="auto"
+                        data-setup='{{}}'>
                         <source src="{html.escape(stream_url)}" type="{self._get_video_mime_type(filename)}">
-                        Your browser does not support the video tag.
-                    </video>
+                        <p class="vjs-no-js">
+                            To view this video please enable JavaScript, and consider upgrading to a web browser that
+                            <a href="https://videojs.com/html5-video-support/" target="_blank">supports HTML5 video</a>.
+                        </p>
+                    </video-js>
                     <div class="loading" id="loading">Loading video...</div>
-                    <div class="error" id="error" style="display: none;"></div>
-                </div>
-                
-                <div class="controls">
-                    <button class="play-pause" id="playPause">▶</button>
-                    <div class="progress-container" id="progressContainer">
-                        <div class="progress-bar" id="progressBar"></div>
-                    </div>
-                    <div class="time-display" id="timeDisplay">0:00 / 0:00</div>
-                    <div class="volume-container">
-                        <span>🔊</span>
-                        <input type="range" class="volume-slider" id="volumeSlider" min="0" max="1" step="0.1" value="1">
-                    </div>
-                    <button class="fullscreen" id="fullscreen">⛶</button>
                 </div>
                 
                 <a href="{base_url}/d?token={urllib.parse.quote(token)}" class="download-btn">Download</a>
-                <a href="{base_url}/test-video?token={urllib.parse.quote(token)}" class="download-btn" style="right: 120px;">Debug</a>
+                <a href="{base_url}/test-video?token={urllib.parse.quote(token)}" class="debug-btn">Debug</a>
             </div>
             
+            <!-- Video.js JavaScript -->
+            <script src="https://vjs.zencdn.net/8.6.1/video.min.js"></script>
+            
             <script>
-                const video = document.getElementById('videoPlayer');
-                const playPause = document.getElementById('playPause');
-                const progressBar = document.getElementById('progressBar');
-                const progressContainer = document.getElementById('progressContainer');
-                const timeDisplay = document.getElementById('timeDisplay');
-                const volumeSlider = document.getElementById('volumeSlider');
-                const fullscreen = document.getElementById('fullscreen');
+                // Initialize Video.js player
+                const player = videojs('videoPlayer', {{
+                    fluid: true,
+                    responsive: true,
+                    html5: {{
+                        vhs: {{
+                            overrideNative: true
+                        }},
+                        nativeVideoTracks: false,
+                        nativeAudioTracks: false,
+                        nativeTextTracks: false
+                    }},
+                    playbackRates: [0.5, 1, 1.25, 1.5, 2],
+                    controls: true,
+                    preload: 'auto'
+                }});
+                
                 const loading = document.getElementById('loading');
-                const error = document.getElementById('error');
                 
-                let isPlaying = false;
-                
-                // Play/Pause functionality
-                playPause.addEventListener('click', () => {{
-                    if (isPlaying) {{
-                        video.pause();
-                    }} else {{
-                        video.play();
-                    }}
-                }});
-                
-                video.addEventListener('play', () => {{
-                    isPlaying = true;
-                    playPause.textContent = '⏸';
+                // Event listeners for debugging
+                player.ready(() => {{
+                    console.log('Video.js player is ready');
                     loading.style.display = 'none';
                 }});
                 
-                video.addEventListener('pause', () => {{
-                    isPlaying = false;
-                    playPause.textContent = '▶';
-                }});
-                
-                // Progress bar
-                video.addEventListener('timeupdate', () => {{
-                    const progress = (video.currentTime / video.duration) * 100;
-                    progressBar.style.width = progress + '%';
-                    
-                    const currentTime = formatTime(video.currentTime);
-                    const duration = formatTime(video.duration);
-                    timeDisplay.textContent = `${{currentTime}} / ${{duration}}`;
-                }});
-                
-                progressContainer.addEventListener('click', (e) => {{
-                    const rect = progressContainer.getBoundingClientRect();
-                    const clickX = e.clientX - rect.left;
-                    const width = rect.width;
-                    const clickTime = (clickX / width) * video.duration;
-                    video.currentTime = clickTime;
-                }});
-                
-                // Volume control
-                volumeSlider.addEventListener('input', (e) => {{
-                    video.volume = e.target.value;
-                }});
-                
-                // Fullscreen
-                fullscreen.addEventListener('click', () => {{
-                    if (document.fullscreenElement) {{
-                        document.exitFullscreen();
-                    }} else {{
-                        video.requestFullscreen();
-                    }}
-                }});
-                
-                // Error handling
-                video.addEventListener('error', (e) => {{
-                    loading.style.display = 'none';
-                    error.style.display = 'block';
-                    error.innerHTML = 'Error loading video. Please try downloading the file instead.';
-                }});
-                
-                video.addEventListener('loadeddata', () => {{
-                    loading.style.display = 'none';
-                    console.log('Video loaded successfully');
-                }});
-                
-                video.addEventListener('loadstart', () => {{
+                player.on('loadstart', () => {{
                     console.log('Video load started');
                 }});
                 
-                video.addEventListener('canplay', () => {{
+                player.on('loadeddata', () => {{
+                    console.log('Video data loaded');
+                    loading.style.display = 'none';
+                }});
+                
+                player.on('canplay', () => {{
                     console.log('Video can start playing');
                 }});
                 
-                video.addEventListener('waiting', () => {{
+                player.on('waiting', () => {{
                     console.log('Video is waiting for data');
                 }});
                 
-                video.addEventListener('stalled', () => {{
+                player.on('stalled', () => {{
                     console.log('Video stalled - no data received');
+                }});
+                
+                player.on('error', (e) => {{
+                    console.error('Video player error:', e);
+                    loading.style.display = 'none';
+                    player.error({{
+                        code: 4,
+                        message: 'Error loading video. Please try downloading the file instead.'
+                    }});
+                }});
+                
+                player.on('play', () => {{
+                    console.log('Video started playing');
+                }});
+                
+                player.on('pause', () => {{
+                    console.log('Video paused');
                 }});
                 
                 // Keyboard shortcuts
@@ -846,47 +736,27 @@ class LinkServer:
                     switch(e.code) {{
                         case 'Space':
                             e.preventDefault();
-                            if (isPlaying) video.pause();
-                            else video.play();
+                            if (player.paused()) {{
+                                player.play();
+                            }} else {{
+                                player.pause();
+                            }}
                             break;
                         case 'ArrowLeft':
-                            video.currentTime -= 10;
+                            player.currentTime(player.currentTime() - 10);
                             break;
                         case 'ArrowRight':
-                            video.currentTime += 10;
+                            player.currentTime(player.currentTime() + 10);
                             break;
                         case 'KeyF':
-                            if (document.fullscreenElement) {{
-                                document.exitFullscreen();
+                            if (player.isFullscreen()) {{
+                                player.exitFullscreen();
                             }} else {{
-                                video.requestFullscreen();
+                                player.requestFullscreen();
                             }}
                             break;
                     }}
                 }});
-                
-                function formatTime(seconds) {{
-                    const mins = Math.floor(seconds / 60);
-                    const secs = Math.floor(seconds % 60);
-                    return `${{mins}}:${{secs.toString().padStart(2, '0')}}`;
-                }}
-                
-                // Auto-hide controls
-                let controlsTimeout;
-                const controls = document.querySelector('.controls');
-                
-                function showControls() {{
-                    controls.style.opacity = '1';
-                    clearTimeout(controlsTimeout);
-                    controlsTimeout = setTimeout(() => {{
-                        if (isPlaying) {{
-                            controls.style.opacity = '0';
-                        }}
-                    }}, 3000);
-                }}
-                
-                document.addEventListener('mousemove', showControls);
-                video.addEventListener('play', showControls);
             </script>
         </body>
         </html>
