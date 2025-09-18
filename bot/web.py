@@ -31,6 +31,7 @@ class LinkServer:
             web.get('/video', self.handle_video_player),
             web.get('/stream', self.handle_video_stream),
             web.get('/info', self.handle_video_info),
+            web.get('/test-video', self.handle_test_video),
         ])
 
     async def start(self):
@@ -742,6 +743,7 @@ class LinkServer:
                 </div>
                 
                 <a href="{base_url}/d?token={urllib.parse.quote(token)}" class="download-btn">Download</a>
+                <a href="{base_url}/test-video?token={urllib.parse.quote(token)}" class="download-btn" style="right: 120px;">Debug</a>
             </div>
             
             <script>
@@ -927,32 +929,33 @@ class LinkServer:
         if not self._is_video_file(filename):
             return web.Response(status=400, text='File is not a supported video format')
         
-        # Check if we need transcoding
-        if self._needs_transcoding(filename) and self.cfg.enable_video_player:
-            return await self._stream_with_transcoding(path, filename, request)
-        else:
-            return await self._stream_direct(path, filename, request)
+        # For now, let's always try direct streaming first for debugging
+        # We'll add transcoding back later once direct streaming works
+        return await self._stream_direct(path, filename, request)
     
     async def _stream_direct(self, path: str, filename: str, request: web.Request) -> web.StreamResponse:
         """Stream video file directly without transcoding"""
         mime_type = self._get_video_mime_type(filename)
         
-        # Get file size
+        # Get file size and basic info
         loop = asyncio.get_running_loop()
         
-        def get_file_size():
+        def get_file_info():
             sftp = None
             try:
                 sftp = self.scanner._connect()
-                return sftp.stat(path).st_size
+                stat = sftp.stat(path)
+                return stat.st_size
+            except Exception as e:
+                raise Exception(f"Failed to get file info: {str(e)}")
             finally:
                 if sftp:
                     sftp.close()
         
         try:
-            file_size = await loop.run_in_executor(None, get_file_size)
-        except Exception:
-            return web.Response(status=404, text='File not found')
+            file_size = await loop.run_in_executor(None, get_file_info)
+        except Exception as e:
+            return web.Response(status=404, text=f'File not found: {str(e)}')
         
         # Handle range requests for video seeking
         range_header = request.headers.get('Range')
@@ -960,10 +963,13 @@ class LinkServer:
         end = file_size - 1
         status = 200
         
+        # Set proper headers for video streaming
         headers = {
             'Content-Type': mime_type,
             'Accept-Ranges': 'bytes',
             'Content-Disposition': f"inline; filename*=UTF-8''{urllib.parse.quote(filename)}",
+            'Cache-Control': 'public, max-age=3600',
+            'X-Content-Type-Options': 'nosniff',
         }
         
         if range_header and range_header.startswith('bytes='):
@@ -981,7 +987,8 @@ class LinkServer:
                 status = 206
                 headers['Content-Range'] = f'bytes {start}-{end}/{file_size}'
                 headers['Content-Length'] = str(end - start + 1)
-            except Exception:
+            except Exception as e:
+                # If range parsing fails, serve the whole file
                 headers['Content-Length'] = str(file_size)
         else:
             headers['Content-Length'] = str(file_size)
@@ -989,8 +996,8 @@ class LinkServer:
         resp = web.StreamResponse(status=status, reason='OK', headers=headers)
         await resp.prepare(request)
         
-        # Stream file content
-        queue = asyncio.Queue(maxsize=10)
+        # Stream file content with better error handling
+        queue = asyncio.Queue(maxsize=5)  # Smaller queue for better memory management
         stop_flag = {"stop": False}
         
         def producer():
@@ -1003,16 +1010,23 @@ class LinkServer:
                     pos = start
                     limit = end
                     while not stop_flag['stop'] and pos <= limit:
-                        to_read = min(64 * 1024, (limit - pos + 1))
+                        to_read = min(128 * 1024, (limit - pos + 1))  # Larger chunks
                         chunk = f.read(to_read)
                         if not chunk:
                             break
                         pos += len(chunk)
                         fut = asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
                         try:
-                            fut.result()
+                            fut.result(timeout=5)  # Add timeout
                         except Exception:
                             break
+            except Exception as e:
+                # Put error in queue
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(queue.put(f"ERROR:{str(e)}"), loop)
+                    fut.result(timeout=2)
+                except Exception:
+                    pass
             finally:
                 try:
                     fut = asyncio.run_coroutine_threadsafe(queue.put(None), loop)
@@ -1022,25 +1036,94 @@ class LinkServer:
                 if sftp:
                     sftp.close()
         
-        loop.run_in_executor(None, producer)
+        producer_future = loop.run_in_executor(None, producer)
         
         try:
             while True:
                 chunk = await queue.get()
                 if chunk is None:
                     break
+                if isinstance(chunk, str) and chunk.startswith("ERROR:"):
+                    return web.Response(status=500, text=f"Streaming error: {chunk[6:]}")
                 try:
                     await resp.write(chunk)
                 except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
                     stop_flag['stop'] = True
                     break
         finally:
+            stop_flag['stop'] = True
+            try:
+                await producer_future
+            except Exception:
+                pass
             try:
                 await resp.write_eof()
             except Exception:
                 pass
         
         return resp
+    
+    async def handle_test_video(self, request: web.Request) -> web.Response:
+        """Test endpoint to debug video streaming issues"""
+        token = request.query.get('token')
+        if not token:
+            return web.Response(status=400, text='Missing token')
+        
+        path = self.verify_token(token)
+        if not path:
+            return web.Response(status=403, text='Invalid or expired token')
+        
+        filename = path.rsplit('/', 1)[-1]
+        
+        # Get file info
+        loop = asyncio.get_running_loop()
+        
+        def get_file_info():
+            sftp = None
+            try:
+                sftp = self.scanner._connect()
+                stat = sftp.stat(path)
+                return {
+                    'filename': filename,
+                    'size': stat.st_size,
+                    'mime_type': self._get_video_mime_type(filename),
+                    'is_video': self._is_video_file(filename),
+                    'needs_transcoding': self._needs_transcoding(filename)
+                }
+            except Exception as e:
+                return {'error': str(e)}
+            finally:
+                if sftp:
+                    sftp.close()
+        
+        try:
+            info = await loop.run_in_executor(None, get_file_info)
+            
+            # Create a simple test page
+            html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head><title>Video Test - {html.escape(filename)}</title></head>
+            <body>
+                <h1>Video Test: {html.escape(filename)}</h1>
+                <pre>{html.escape(str(info))}</pre>
+                <h2>Test Links:</h2>
+                <ul>
+                    <li><a href="/stream?token={token}" target="_blank">Direct Stream</a></li>
+                    <li><a href="/video?token={token}" target="_blank">Video Player</a></li>
+                    <li><a href="/d?token={token}">Download</a></li>
+                </ul>
+                <h2>Browser Test:</h2>
+                <video controls width="800" height="450">
+                    <source src="/stream?token={token}" type="{info.get('mime_type', 'video/mp4')}">
+                    Your browser does not support the video tag.
+                </video>
+            </body>
+            </html>
+            """
+            return web.Response(text=html, content_type='text/html')
+        except Exception as e:
+            return web.Response(status=500, text=f"Test failed: {str(e)}")
     
     async def _stream_with_transcoding(self, path: str, filename: str, request: web.Request) -> web.StreamResponse:
         """Stream video with FFmpeg transcoding for browser compatibility"""
