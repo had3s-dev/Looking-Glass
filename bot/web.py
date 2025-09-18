@@ -929,9 +929,11 @@ class LinkServer:
         if not self._is_video_file(filename):
             return web.Response(status=400, text='File is not a supported video format')
         
-        # For now, let's always try direct streaming first for debugging
-        # We'll add transcoding back later once direct streaming works
-        return await self._stream_direct(path, filename, request)
+        # Check if we need transcoding for browser compatibility
+        if self._needs_transcoding(filename) and self.cfg.enable_video_player:
+            return await self._stream_with_transcoding(path, filename, request)
+        else:
+            return await self._stream_direct(path, filename, request)
     
     async def _stream_direct(self, path: str, filename: str, request: web.Request) -> web.StreamResponse:
         """Stream video file directly without transcoding"""
@@ -1135,6 +1137,7 @@ class LinkServer:
             'Content-Type': 'video/mp4',
             'Content-Disposition': f"inline; filename*=UTF-8''{urllib.parse.quote(filename.rsplit('.', 1)[0] + '.mp4')}",
             'Accept-Ranges': 'none',  # Can't seek in transcoded stream
+            'Cache-Control': 'no-cache',  # Don't cache transcoded content
         }
         
         resp = web.StreamResponse(status=200, reason='OK', headers=headers)
@@ -1142,18 +1145,22 @@ class LinkServer:
         
         loop = asyncio.get_running_loop()
         
-        # FFmpeg command for transcoding to MP4
+        # Optimized FFmpeg command for MKV to MP4 transcoding
         cmd = [
             self.cfg.ffmpeg_path,
-            '-hide_banner', '-loglevel', 'error',
+            '-hide_banner', '-loglevel', 'error', '-stats',
             '-i', 'pipe:0',
             '-c:v', 'libx264',  # H.264 for broad compatibility
-            '-preset', 'fast',  # Fast encoding for streaming
-            '-crf', '23',       # Good quality/size balance
+            '-preset', 'ultrafast',  # Fastest encoding for streaming
+            '-crf', '28',       # Higher CRF for faster encoding (slightly lower quality)
+            '-maxrate', '2M',   # Limit bitrate for faster streaming
+            '-bufsize', '4M',   # Buffer size
             '-c:a', 'aac',      # AAC audio
             '-b:a', '128k',     # Audio bitrate
+            '-ac', '2',         # Stereo audio
             '-movflags', '+faststart+frag_keyframe+empty_moov',  # Progressive download
             '-f', 'mp4',
+            '-avoid_negative_ts', 'make_zero',  # Fix timestamp issues
             'pipe:1',
         ]
         
@@ -1175,14 +1182,17 @@ class LinkServer:
                     sftp = self.scanner._connect()
                     with sftp.open(path, 'rb') as f:
                         while not stop_flag['stop']:
-                            chunk = f.read(128 * 1024)
+                            chunk = f.read(256 * 1024)  # Larger chunks for transcoding
                             if not chunk:
                                 break
                             try:
                                 if proc.stdin is not None:
                                     proc.stdin.write(chunk)
+                                    proc.stdin.flush()  # Ensure data is sent
                             except Exception:
                                 break
+                except Exception as e:
+                    print(f"Feeder error: {e}")
                 finally:
                     try:
                         if proc.stdin:
@@ -1198,13 +1208,16 @@ class LinkServer:
                 # Consumer: stream FFmpeg output to client
                 if proc.stdout is not None:
                     while True:
-                        chunk = await proc.stdout.read(64 * 1024)
+                        chunk = await proc.stdout.read(128 * 1024)  # Larger output chunks
                         if not chunk:
                             break
                         try:
                             await resp.write(chunk)
                         except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
+                            stop_flag['stop'] = True
                             break
+            except Exception as e:
+                print(f"Consumer error: {e}")
             finally:
                 stop_flag['stop'] = True
                 try:
