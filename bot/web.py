@@ -529,6 +529,7 @@ class LinkServer:
         """Check if file needs transcoding for browser compatibility"""
         lower = filename.lower()
         # MKV and AVI typically need transcoding for browser playback
+        # But we'll try direct streaming first if FFmpeg is not available
         return lower.endswith('.mkv') or lower.endswith('.avi')
     
     async def handle_video_player(self, request: web.Request) -> web.Response:
@@ -931,7 +932,14 @@ class LinkServer:
         
         # Check if we need transcoding for browser compatibility
         if self._needs_transcoding(filename) and self.cfg.enable_video_player:
-            return await self._stream_with_transcoding(path, filename, request)
+            # Check if FFmpeg is available
+            ffmpeg_path = await self._find_ffmpeg()
+            if ffmpeg_path:
+                return await self._stream_with_transcoding(path, filename, request)
+            else:
+                print("FFmpeg not available, trying direct streaming for MKV/AVI")
+                # Fallback to direct streaming - some browsers can handle MKV
+                return await self._stream_direct(path, filename, request)
         else:
             return await self._stream_direct(path, filename, request)
     
@@ -1065,6 +1073,38 @@ class LinkServer:
         
         return resp
     
+    async def _find_ffmpeg(self) -> Optional[str]:
+        """Find FFmpeg executable path"""
+        import shutil
+        import subprocess
+        
+        # Try common paths
+        common_paths = [
+            'ffmpeg',
+            '/usr/bin/ffmpeg',
+            '/usr/local/bin/ffmpeg',
+            '/opt/homebrew/bin/ffmpeg',
+            '/snap/bin/ffmpeg',
+        ]
+        
+        for path in common_paths:
+            try:
+                result = subprocess.run([path, '-version'], capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    print(f"Found FFmpeg at: {path}")
+                    return path
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                continue
+        
+        # Try using shutil.which
+        ffmpeg_path = shutil.which('ffmpeg')
+        if ffmpeg_path:
+            print(f"Found FFmpeg via shutil.which: {ffmpeg_path}")
+            return ffmpeg_path
+        
+        print("FFmpeg not found in any common locations")
+        return None
+    
     async def handle_test_video(self, request: web.Request) -> web.Response:
         """Test endpoint to debug video streaming issues"""
         token = request.query.get('token')
@@ -1132,6 +1172,11 @@ class LinkServer:
         if not self.cfg.enable_video_player:
             return web.Response(status=403, text='Video player disabled')
         
+        # Find FFmpeg path
+        ffmpeg_path = await self._find_ffmpeg()
+        if not ffmpeg_path:
+            return web.Response(status=500, text='FFmpeg not found on this system')
+        
         # Prepare response headers for MP4 output
         headers = {
             'Content-Type': 'video/mp4',
@@ -1147,7 +1192,7 @@ class LinkServer:
         
         # Try copy streams first (much faster), fallback to re-encoding if needed
         cmd = [
-            self.cfg.ffmpeg_path,
+            ffmpeg_path,
             '-hide_banner', '-loglevel', 'error', '-stats',
             '-i', 'pipe:0',
             '-c', 'copy',  # Copy streams without re-encoding
