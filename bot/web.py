@@ -1102,7 +1102,7 @@ class LinkServer:
             info = await loop.run_in_executor(None, get_file_info)
             
             # Create a simple test page
-            html = f"""
+            html_content = f"""
             <!DOCTYPE html>
             <html>
             <head><title>Video Test - {html.escape(filename)}</title></head>
@@ -1123,7 +1123,7 @@ class LinkServer:
             </body>
             </html>
             """
-            return web.Response(text=html, content_type='text/html')
+            return web.Response(text=html_content, content_type='text/html')
         except Exception as e:
             return web.Response(status=500, text=f"Test failed: {str(e)}")
     
