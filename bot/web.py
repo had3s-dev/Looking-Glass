@@ -1145,19 +1145,12 @@ class LinkServer:
         
         loop = asyncio.get_running_loop()
         
-        # Optimized FFmpeg command for MKV to MP4 transcoding
+        # Try copy streams first (much faster), fallback to re-encoding if needed
         cmd = [
             self.cfg.ffmpeg_path,
             '-hide_banner', '-loglevel', 'error', '-stats',
             '-i', 'pipe:0',
-            '-c:v', 'libx264',  # H.264 for broad compatibility
-            '-preset', 'ultrafast',  # Fastest encoding for streaming
-            '-crf', '28',       # Higher CRF for faster encoding (slightly lower quality)
-            '-maxrate', '2M',   # Limit bitrate for faster streaming
-            '-bufsize', '4M',   # Buffer size
-            '-c:a', 'aac',      # AAC audio
-            '-b:a', '128k',     # Audio bitrate
-            '-ac', '2',         # Stereo audio
+            '-c', 'copy',  # Copy streams without re-encoding
             '-movflags', '+faststart+frag_keyframe+empty_moov',  # Progressive download
             '-f', 'mp4',
             '-avoid_negative_ts', 'make_zero',  # Fix timestamp issues
@@ -1166,12 +1159,14 @@ class LinkServer:
         
         async def run_ffmpeg():
             # Launch FFmpeg process
+            print(f"Starting FFmpeg with command: {' '.join(cmd)}")
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            print(f"FFmpeg process started with PID: {proc.pid}")
             
             # Producer: read from SFTP and feed FFmpeg
             stop_flag = {'stop': False}
@@ -1207,10 +1202,15 @@ class LinkServer:
             try:
                 # Consumer: stream FFmpeg output to client
                 if proc.stdout is not None:
+                    first_chunk = True
                     while True:
                         chunk = await proc.stdout.read(128 * 1024)  # Larger output chunks
                         if not chunk:
+                            print("FFmpeg output ended")
                             break
+                        if first_chunk:
+                            print(f"First chunk received: {len(chunk)} bytes")
+                            first_chunk = False
                         try:
                             await resp.write(chunk)
                         except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
@@ -1245,7 +1245,14 @@ class LinkServer:
                     pass
         
         try:
-            await run_ffmpeg()
+            # Add timeout for FFmpeg startup
+            await asyncio.wait_for(run_ffmpeg(), timeout=300)  # 5 minute timeout
+        except asyncio.TimeoutError:
+            print("FFmpeg transcoding timed out")
+            return web.Response(status=408, text='Transcoding timeout')
+        except Exception as e:
+            print(f"FFmpeg error: {e}")
+            return web.Response(status=500, text=f'Transcoding failed: {str(e)}')
         finally:
             try:
                 await resp.write_eof()
