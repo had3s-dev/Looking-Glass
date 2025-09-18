@@ -1223,11 +1223,13 @@ class LinkServer:
             # Producer: read from SFTP and feed FFmpeg
             stop_flag = {'stop': False}
             
-            def feeder():
+            async def feeder():
                 sftp = None
                 try:
                     sftp = self.scanner._connect()
                     with sftp.open(path, 'rb') as f:
+                        chunk_count = 0
+                        total_bytes = 0
                         while not stop_flag['stop']:
                             chunk = f.read(256 * 1024)  # Larger chunks for transcoding
                             if not chunk:
@@ -1235,21 +1237,44 @@ class LinkServer:
                             try:
                                 if proc.stdin is not None:
                                     proc.stdin.write(chunk)
-                                    proc.stdin.flush()  # Ensure data is sent
-                            except Exception:
+                                    await proc.stdin.drain()  # Proper async drain
+                                    chunk_count += 1
+                                    total_bytes += len(chunk)
+                                    if chunk_count % 10 == 0:  # Log every 10 chunks
+                                        print(f"Fed {chunk_count} chunks, {total_bytes} bytes total")
+                            except Exception as e:
+                                print(f"Error writing to FFmpeg stdin: {e}")
                                 break
+                        print(f"Feeder finished: {chunk_count} chunks, {total_bytes} bytes total")
                 except Exception as e:
                     print(f"Feeder error: {e}")
                 finally:
                     try:
                         if proc.stdin:
                             proc.stdin.close()
-                    except Exception:
-                        pass
+                            await proc.stdin.wait_closed()
+                    except Exception as e:
+                        print(f"Error closing stdin: {e}")
                     if sftp:
                         sftp.close()
             
-            feeder_future = loop.run_in_executor(None, feeder)
+            feeder_task = asyncio.create_task(feeder())
+            
+            # Start stderr reader for debugging
+            async def stderr_reader():
+                try:
+                    if proc.stderr is not None:
+                        while True:
+                            line = await proc.stderr.readline()
+                            if not line:
+                                break
+                            line_str = line.decode('utf-8', errors='ignore').strip()
+                            if line_str:
+                                print(f"FFmpeg stderr: {line_str}")
+                except Exception as e:
+                    print(f"Stderr reader error: {e}")
+            
+            stderr_task = asyncio.create_task(stderr_reader())
             
             try:
                 # Consumer: stream FFmpeg output to client
@@ -1272,9 +1297,14 @@ class LinkServer:
                 print(f"Consumer error: {e}")
             finally:
                 stop_flag['stop'] = True
+                stderr_task.cancel()
                 try:
-                    await feeder_future
-                except Exception:
+                    await feeder_task
+                except Exception as e:
+                    print(f"Error waiting for feeder: {e}")
+                try:
+                    await stderr_task
+                except asyncio.CancelledError:
                     pass
                 try:
                     if proc.stdout:
