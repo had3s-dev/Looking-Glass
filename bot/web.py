@@ -1190,12 +1190,19 @@ class LinkServer:
         
         loop = asyncio.get_running_loop()
         
-        # Try copy streams first (much faster), fallback to re-encoding if needed
+        # Re-encode for better compatibility (stream copy can be unreliable)
         cmd = [
             ffmpeg_path,
             '-hide_banner', '-loglevel', 'error', '-stats',
             '-i', 'pipe:0',
-            '-c', 'copy',  # Copy streams without re-encoding
+            '-c:v', 'libx264',  # Re-encode video for compatibility
+            '-preset', 'ultrafast',  # Fast encoding
+            '-crf', '28',  # Good quality/size balance
+            '-maxrate', '2M',  # Limit bitrate
+            '-bufsize', '4M',
+            '-c:a', 'aac',  # Re-encode audio
+            '-b:a', '128k',  # Audio bitrate
+            '-ac', '2',  # Stereo
             '-movflags', '+faststart+frag_keyframe+empty_moov',  # Progressive download
             '-f', 'mp4',
             '-avoid_negative_ts', 'make_zero',  # Fix timestamp issues
