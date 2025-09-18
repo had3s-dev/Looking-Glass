@@ -46,7 +46,7 @@ class UnifiedBrowserView(discord.ui.View):
         get_tv: Callable[[], Dict[str, List[str]]],
         get_music: Callable[[], Dict[str, List[str]]],
         build_links: Optional[Callable[[str, str], List[Tuple[str, str, int]]]] = None,
-        build_stream_links: Optional[Callable[[str, str], List[Tuple[str, str, int]]]] = None,
+        build_video_links: Optional[Callable[[str, str], List[Tuple[str, str, int]]]] = None,
         bot: Optional[commands.Bot] = None,
         config: Optional[Config] = None,
         scanner: Optional[SeedboxScanner] = None,
@@ -60,7 +60,7 @@ class UnifiedBrowserView(discord.ui.View):
         self.get_tv = get_tv
         self.get_music = get_music
         self.build_links = build_links
-        self.build_stream_links = build_stream_links
+        self.build_video_links = build_video_links
         self.bot = bot
         self.config = config
         self.scanner = scanner
@@ -209,26 +209,32 @@ class UnifiedBrowserView(discord.ui.View):
             loop = asyncio.get_running_loop()
             try:
                 items: List[Tuple[str, str, int]] = await loop.run_in_executor(None, lambda: self.build_links(self.category or "", item_name))
-                stream_items: List[Tuple[str, str, int]] = []
-                if self.build_stream_links and (self.category in ("movies", "tv")):
+                video_items: List[Tuple[str, str, int]] = []
+                
+                # Get video player links for movies and TV
+                if self.build_video_links and self.category in ("movies", "tv"):
                     try:
-                        stream_items = await loop.run_in_executor(None, lambda: self.build_stream_links(self.category or "", item_name))
+                        video_items = await loop.run_in_executor(None, lambda: self.build_video_links(self.category or "", item_name))
                     except Exception:
-                        stream_items = []
+                        video_items = []
 
-                if items or stream_items:
+                if items or video_items:
                     # Build a concise DM message
                     lines: List[str] = []
                     title = f"Links for {self.category.title()}: {item_name}"
                     lines.append(title)
-                    if stream_items:
-                        lines.append("Stream now (single-use):")
-                        for filename, link, size in stream_items[:50]:
+                    
+                    if video_items:
+                        lines.append("🎬 Watch online:")
+                        for filename, link, size in video_items[:10]:  # Limit video links
                             lines.append(f"- {filename} — {link}")
+                        lines.append("")  # Empty line separator
+                    
                     if items:
-                        lines.append("Direct downloads:")
+                        lines.append("📁 Direct downloads:")
                         for filename, link, size in items[:50]:  # cap to reasonable number
                             lines.append(f"- {filename} — {link}")
+                    
                     content = "\n".join(lines)
                     await interaction.user.send(content)
                     dm_sent = True
@@ -283,7 +289,7 @@ class UnifiedBrowserView(discord.ui.View):
             await interaction.response.edit_message(embed=self._embed(title, "Pick an artist to get links for tracks."), view=self)
 
     @staticmethod
-    async def send(ctx, base_url: str, page_size: int, get_books_data, get_movies, get_tv, get_music, build_links=None, build_stream_links=None, bot=None, config=None, scanner=None, rescan_callback=None):
+    async def send(ctx, base_url: str, page_size: int, get_books_data, get_movies, get_tv, get_music, build_links=None, build_video_links=None, bot=None, config=None, scanner=None, rescan_callback=None):
         view = UnifiedBrowserView(
             base_url,
             page_size,
@@ -292,7 +298,7 @@ class UnifiedBrowserView(discord.ui.View):
             get_tv,
             get_music,
             build_links,
-            build_stream_links,
+            build_video_links,
             bot=bot,
             config=config,
             scanner=scanner,

@@ -83,6 +83,8 @@ python -m bot
    - `SFTP_PASSWORD` or configure a variable with your private key file path; see note below.
    - `LIBRARY_ROOT_PATH`
    - Optionally: `SFTP_PORT`, `FILE_EXTENSIONS`, `COMMAND_PREFIX`, `PAGE_SIZE`, `CACHE_TTL_SECONDS`
+   - For video player: `ENABLE_VIDEO_PLAYER=true`, `ENABLE_HTTP_LINKS=true`
+   - For video transcoding: `FFMPEG_PATH=ffmpeg` (Railway provides this automatically)
 3. Railway will detect the `Procfile` and run `worker: python -m bot`.
 
 ### Using SSH Key Auth on Railway
@@ -103,6 +105,13 @@ If you prefer key-based auth, you have two options:
 
 - Set `ENABLE_HTTP_LINKS=true` to enable the internal `aiohttp` server that serves a simple links page and signed download endpoints.
 - Configure `HTTP_HOST`, `HTTP_PORT`, `PUBLIC_BASE_URL` (if using a reverse proxy), `LINK_TTL_SECONDS`, and `LINK_SECRET`.
+
+### Video Player
+
+- Set `ENABLE_VIDEO_PLAYER=true` to enable the web-based video player for Movies and TV shows.
+- Configure `FFMPEG_PATH` (default: "ffmpeg"), `VIDEO_CACHE_SECONDS` (default: 3600), and `MAX_CONCURRENT_STREAMS` (default: 3).
+- The player supports MP4, MKV, WebM, MOV, and AVI files with automatic transcoding for browser compatibility.
+- MKV and AVI files are automatically transcoded to MP4 for optimal browser playback.
 
 ## Project Structure
 

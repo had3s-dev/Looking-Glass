@@ -28,9 +28,9 @@ class LinkServer:
             web.get('/', self.handle_root),
             web.get('/upload', self.handle_upload_form),
             web.post('/upload', self.handle_upload),
-            web.get('/stream', self.handle_stream),
-            web.get('/play', self.handle_play),
-            web.get('/transmux', self.handle_transmux),
+            web.get('/video', self.handle_video_player),
+            web.get('/stream', self.handle_video_stream),
+            web.get('/info', self.handle_video_info),
         ])
 
     async def start(self):
@@ -83,73 +83,7 @@ class LinkServer:
         except Exception:
             return None
 
-    # ---- Single-use streaming helpers ----
-    # token -> {"exp": int, "uses": int}
-    _single_use_tokens: Dict[str, Dict[str, int]] = {}
 
-    def _register_single_use_token(self, token: str, exp_ts: int, max_uses: int = 4) -> None:
-        import time
-        now = int(time.time())
-        # Opportunistic cleanup of expired tokens
-        for k, v in list(self._single_use_tokens.items()):
-            if v.get("exp", 0) < now:
-                self._single_use_tokens.pop(k, None)
-        self._single_use_tokens[token] = {"exp": exp_ts, "uses": max(1, max_uses)}
-
-    def _consume_single_use_token(self, token: str) -> bool:
-        # Decrement usage; remove when reaches zero
-        rec = self._single_use_tokens.get(token)
-        if not rec:
-            return False
-        rec["uses"] = max(0, rec.get("uses", 1) - 1)
-        if rec["uses"] <= 0:
-            self._single_use_tokens.pop(token, None)
-        else:
-            self._single_use_tokens[token] = rec
-        return True
-
-    def _is_token_valid(self, token: str) -> bool:
-        import time
-        rec = self._single_use_tokens.get(token)
-        if not rec:
-            return False
-        if rec.get("exp", 0) < int(time.time()):
-            # expired
-            self._single_use_tokens.pop(token, None)
-            return False
-        if rec.get("uses", 0) <= 0:
-            return False
-        return True
-
-    def _guess_mime(self, filename: str) -> str:
-        lower = filename.lower()
-        if lower.endswith('.mp4') or lower.endswith('.m4v'):
-            return 'video/mp4'
-        if lower.endswith('.webm'):
-            return 'video/webm'
-        if lower.endswith('.mov'):
-            return 'video/quicktime'
-        if lower.endswith('.mkv'):
-            return 'video/x-matroska'
-        if lower.endswith('.mp3'):
-            return 'audio/mpeg'
-        if lower.endswith('.flac'):
-            return 'audio/flac'
-        if lower.endswith('.m4a'):
-            return 'audio/mp4'
-        return 'application/octet-stream'
-
-    def _is_browser_playable(self, filename: str) -> bool:
-        lower = filename.lower()
-        return lower.endswith('.mp4') or lower.endswith('.m4v') or lower.endswith('.webm') or lower.endswith('.mov')
-
-    def _estimate_duration_seconds(self, size_bytes: int) -> int:
-        # Simple estimate: duration = size / bitrate. Default 6 Mbps.
-        bitrate_bps = 6_000_000
-        try:
-            return max(0, int(size_bytes / max(1, bitrate_bps)))
-        except Exception:
-            return 0
 
     # ---- Routes ----
     async def handle_upload_form(self, request: web.Request) -> web.Response:
@@ -289,17 +223,6 @@ class LinkServer:
             url = f"{base}/d?token={urllib.parse.quote(token)}"
             items.append((path.rsplit('/', 1)[-1], url, size))
 
-        # Build single-use stream links for videos
-        stream_items: List[Tuple[str, str, int]] = []
-        if kind in ('movies', 'tv'):
-            now = int(time.time())
-            for path, size in files:
-                est = self._estimate_duration_seconds(size)
-                s_exp = now + max(self.cfg.link_ttl_seconds, est * 2 if est > 0 else self.cfg.link_ttl_seconds)
-                stoken = self.sign_path(path, s_exp)
-                self._register_single_use_token(stoken, s_exp)
-                surl = f"{base}/play?token={urllib.parse.quote(stoken)}"
-                stream_items.append((path.rsplit('/', 1)[-1], surl, size))
 
         # Simple HTML
         title = f"Links for {html.escape(name)} ({html.escape(kind)})"
@@ -309,12 +232,6 @@ class LinkServer:
         else:
             body.append("<ul>")
             for filename, url, size in items:
-                body.append(f"<li><a href='{html.escape(url)}'>{html.escape(filename)}</a> <small>({size} bytes)</small></li>")
-            body.append("</ul>")
-        if stream_items:
-            body.append("<h2>Stream Now (single-use)</h2>")
-            body.append("<ul>")
-            for filename, url, size in stream_items:
                 body.append(f"<li><a href='{html.escape(url)}'>{html.escape(filename)}</a> <small>({size} bytes)</small></li>")
             body.append("</ul>")
         return web.Response(text="\n".join(body), content_type='text/html')
@@ -339,213 +256,33 @@ class LinkServer:
             items.append((path.rsplit('/', 1)[-1], url, size))
         return items
 
-    def build_stream_links(self, kind: str, name: str) -> List[Tuple[str, str, int]]:
+    def build_video_links(self, kind: str, name: str) -> List[Tuple[str, str, int]]:
         """
-        Build single-use streaming links for Movies/TV selection.
+        Build video player links for Movies/TV selection.
         Returns a list of tuples: (filename, url, size_bytes).
         """
         if kind not in ('movies', 'tv'):
             return []
+        
+        # Collect matching video files via SFTP
         files: List[Tuple[str, int]] = self._collect_files_sync(kind, name)
         base = self._base_url()
         import time
-        now = int(time.time())
+        exp = int(time.time()) + self.cfg.link_ttl_seconds
         out: List[Tuple[str, str, int]] = []
+        
         for path, size in files:
-            est = self._estimate_duration_seconds(size)
-            exp = now + max(self.cfg.link_ttl_seconds, est * 2 if est > 0 else self.cfg.link_ttl_seconds)
-            token = self.sign_path(path, exp)
-            self._register_single_use_token(token, exp)
-            url = f"{base}/play?token={urllib.parse.quote(token)}"
-            out.append((path.rsplit('/', 1)[-1], url, size))
+            filename = path.rsplit('/', 1)[-1]
+            # Only include video files
+            if self._is_video_file(filename):
+                token = self.sign_path(path, exp)
+                url = f"{base}/video?token={urllib.parse.quote(token)}"
+                out.append((filename, url, size))
+        
         return out
 
-    async def handle_play(self, request: web.Request) -> web.Response:
-        token = request.query.get('token')
-        if not token:
-            return web.Response(status=400, text='Missing token')
-        path = self.verify_token(token)
-        if not path:
-            return web.Response(status=403, text='Invalid or expired token')
-        filename = path.rsplit('/', 1)[-1]
-        mime = self._guess_mime(filename)
-        base = self._base_url()
-        # We intentionally do NOT consume the token here; /stream will consume it on first response.
-        stream_url = f"{base}/stream?token={urllib.parse.quote(token)}"
-        esc_name = html.escape(filename)
-        esc_stream = html.escape(stream_url)
-        # If the format isn't browser-playable and ffmpeg remux is enabled, use transmux URL
-        if (not self._is_browser_playable(filename)) and self.cfg.enable_ffmpeg_remux:
-            stream_url = f"{base}/transmux?token={urllib.parse.quote(token)}"
 
-        page = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset='utf-8'>
-            <meta name='viewport' content='width=device-width, initial-scale=1'>
-            <title>Play {esc_name}</title>
-            <style>
-                html, body {{ height: 100%; margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif; }}
-                .container {{ display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 12px; }}
-                video {{ width: 100%; height: auto; max-width: 100%; background: #000; }}
-                a.button {{ background: #2d6cdf; color: white; padding: 8px 12px; border-radius: 6px; text-decoration: none; }}
-                .note {{ font-size: 0.9em; color: #aaa; }}
-                .wrap {{ width: min(1200px, 100%); }}
-                .warn {{ color: #ffcc66; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="wrap">
-                    <h2>{esc_name}</h2>
-                    <video controls autoplay playsinline preload="metadata">
-                        <source src="{html.escape(stream_url)}" type="{('video/mp4' if (not self._is_browser_playable(filename)) and self.cfg.enable_ffmpeg_remux else mime)}">
-                        Your browser may not support this media type. Try the direct link below.
-                    </video>
-                    <div>
-                        <a class="button" href="{esc_stream}">Open direct stream</a>
-                    </div>
-                    <div class="note">This is a single-use link. If playback fails to start, you'll need a new link.</div>
-                    {('<div class="note warn">This format may not play in your browser. Use the direct link with an external player (e.g., VLC).</div>' if not self._is_browser_playable(filename) else '')}
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-        return web.Response(text=page, content_type='text/html')
 
-    async def handle_transmux(self, request: web.Request) -> web.StreamResponse:
-        token = request.query.get('token')
-        if not token:
-            return web.Response(status=400, text='Missing token')
-        path = self.verify_token(token)
-        if not path:
-            return web.Response(status=403, text='Invalid or expired token')
-        if not self.cfg.enable_ffmpeg_remux:
-            return web.Response(status=403, text='Remux disabled')
-        if not self._is_token_valid(token):
-            return web.Response(status=403, text='Token already used or invalid.')
-
-        filename = path.rsplit('/', 1)[-1]
-
-        # Prepare response headers for progressive MP4
-        headers = {
-            'Content-Type': 'video/mp4',
-            'Content-Disposition': f"inline; filename*=UTF-8''{urllib.parse.quote(filename.rsplit('.', 1)[0] + '.mp4')}",
-            # We don't know Content-Length ahead of time when transcoding; omit it.
-            'Accept-Ranges': 'none',
-        }
-        resp = web.StreamResponse(status=200, reason='OK', headers=headers)
-        await resp.prepare(request)
-
-        loop = asyncio.get_running_loop()
-
-        # Start ffmpeg subprocess reading from stdin ('-') and writing MP4 to stdout ('-')
-        # Use copy for video if possible; audio to AAC; faststart flags for progressive playback.
-        # Note: On some inputs, copy may fail; a safer default is to transcode video. We start with copy for performance.
-        cmd = [
-            self.cfg.ffmpeg_path,
-            '-hide_banner', '-loglevel', 'error',
-            '-i', 'pipe:0',
-            '-movflags', '+faststart+frag_keyframe+empty_moov',
-            '-c:v', 'copy',
-            '-c:a', 'aac', '-b:a', '192k',
-            '-f', 'mp4',
-            'pipe:1',
-        ]
-
-        # Token consumption will occur after first successful write
-        consumed = {'done': False}
-
-        async def run_ffmpeg():
-            # Launch ffmpeg
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            # Producer: read from SFTP and feed ffmpeg stdin in a thread to avoid blocking
-            stop_flag = {'stop': False}
-
-            def feeder():
-                sftp = None
-                try:
-                    sftp = self.scanner._connect()
-                    with sftp.open(path, 'rb') as f:
-                        while not stop_flag['stop']:
-                            chunk = f.read(128 * 1024)
-                            if not chunk:
-                                break
-                            try:
-                                if proc.stdin is not None:
-                                    proc.stdin.write(chunk)  # type: ignore
-                            except Exception:
-                                break
-                finally:
-                    try:
-                        if proc.stdin:
-                            proc.stdin.close()  # type: ignore
-                    except Exception:
-                        pass
-                    try:
-                        if sftp:
-                            sftp.close()
-                    except Exception:
-                        pass
-
-            feeder_future = loop.run_in_executor(None, feeder)
-
-            try:
-                # Consumer: stream ffmpeg stdout to client
-                assert proc.stdout is not None
-                while True:
-                    chunk = await proc.stdout.read(128 * 1024)
-                    if not chunk:
-                        break
-                    try:
-                        if not consumed['done']:
-                            self._consume_single_use_token(token)
-                            consumed['done'] = True
-                        await resp.write(chunk)
-                    except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
-                        break
-            finally:
-                stop_flag['stop'] = True
-                try:
-                    await feeder_future
-                except Exception:
-                    pass
-                try:
-                    if proc.stdout:
-                        proc.stdout.close()  # type: ignore
-                except Exception:
-                    pass
-                try:
-                    if proc.stderr:
-                        proc.stderr.close()  # type: ignore
-                except Exception:
-                    pass
-                try:
-                    if proc.stdin:
-                        proc.stdin.close()  # type: ignore
-                except Exception:
-                    pass
-                try:
-                    await proc.wait()
-                except Exception:
-                    pass
-
-        try:
-            await run_ffmpeg()
-        finally:
-            try:
-                await resp.write_eof()
-            except Exception:
-                pass
-        return resp
 
     def _collect_files_sync(self, kind: str, name: str) -> List[Tuple[str, int]]:
         import posixpath
@@ -743,53 +480,470 @@ class LinkServer:
                 pass
         return resp
 
-    async def handle_stream(self, request: web.Request) -> web.StreamResponse:
+    # ---- Video Player Routes ----
+    
+    def _is_video_file(self, filename: str) -> bool:
+        """Check if file is a supported video format"""
+        video_extensions = ['.mp4', '.mkv', '.webm', '.mov', '.avi']
+        return any(filename.lower().endswith(ext) for ext in video_extensions)
+    
+    def _get_video_mime_type(self, filename: str) -> str:
+        """Get MIME type for video file"""
+        lower = filename.lower()
+        if lower.endswith('.mp4') or lower.endswith('.m4v'):
+            return 'video/mp4'
+        elif lower.endswith('.webm'):
+            return 'video/webm'
+        elif lower.endswith('.mov'):
+            return 'video/quicktime'
+        elif lower.endswith('.mkv'):
+            return 'video/x-matroska'
+        elif lower.endswith('.avi'):
+            return 'video/x-msvideo'
+        return 'video/mp4'  # Default fallback
+    
+    def _needs_transcoding(self, filename: str) -> bool:
+        """Check if file needs transcoding for browser compatibility"""
+        lower = filename.lower()
+        # MKV and AVI typically need transcoding for browser playback
+        return lower.endswith('.mkv') or lower.endswith('.avi')
+    
+    async def handle_video_player(self, request: web.Request) -> web.Response:
+        """Serve the video player HTML page"""
         token = request.query.get('token')
         if not token:
             return web.Response(status=400, text='Missing token')
+        
         path = self.verify_token(token)
         if not path:
             return web.Response(status=403, text='Invalid or expired token')
-
-        # Enforce token validity (not expired and has remaining uses)
-        if not self._is_token_valid(token):
-            return web.Response(status=403, text='Token already used or invalid.')
-
+        
         filename = path.rsplit('/', 1)[-1]
-        mime = self._guess_mime(filename)
-
+        if not self._is_video_file(filename):
+            return web.Response(status=400, text='File is not a supported video format')
+        
+        base_url = self._base_url()
+        stream_url = f"{base_url}/stream?token={urllib.parse.quote(token)}"
+        info_url = f"{base_url}/info?token={urllib.parse.quote(token)}"
+        
+        # Modern video player HTML with better UX
+        html_content = f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Playing: {html.escape(filename)}</title>
+            <style>
+                * {{
+                    margin: 0;
+                    padding: 0;
+                    box-sizing: border-box;
+                }}
+                
+                body {{
+                    background: #0a0a0a;
+                    color: #ffffff;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    overflow: hidden;
+                }}
+                
+                .player-container {{
+                    position: relative;
+                    width: 100vw;
+                    height: 100vh;
+                    display: flex;
+                    flex-direction: column;
+                    background: #000;
+                }}
+                
+                .video-wrapper {{
+                    flex: 1;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    position: relative;
+                }}
+                
+                video {{
+                    width: 100%;
+                    height: 100%;
+                    object-fit: contain;
+                    background: #000;
+                }}
+                
+                .controls {{
+                    position: absolute;
+                    bottom: 0;
+                    left: 0;
+                    right: 0;
+                    background: linear-gradient(transparent, rgba(0,0,0,0.8));
+                    padding: 20px;
+                    display: flex;
+                    align-items: center;
+                    gap: 15px;
+                    opacity: 0;
+                    transition: opacity 0.3s ease;
+                }}
+                
+                .player-container:hover .controls {{
+                    opacity: 1;
+                }}
+                
+                .play-pause {{
+                    background: #ff6b6b;
+                    border: none;
+                    color: white;
+                    width: 50px;
+                    height: 50px;
+                    border-radius: 50%;
+                    font-size: 18px;
+                    cursor: pointer;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    transition: background 0.2s ease;
+                }}
+                
+                .play-pause:hover {{
+                    background: #ff5252;
+                }}
+                
+                .progress-container {{
+                    flex: 1;
+                    height: 6px;
+                    background: rgba(255,255,255,0.3);
+                    border-radius: 3px;
+                    cursor: pointer;
+                    position: relative;
+                }}
+                
+                .progress-bar {{
+                    height: 100%;
+                    background: #ff6b6b;
+                    border-radius: 3px;
+                    width: 0%;
+                    transition: width 0.1s ease;
+                }}
+                
+                .time-display {{
+                    color: #ccc;
+                    font-size: 14px;
+                    min-width: 100px;
+                    text-align: center;
+                }}
+                
+                .volume-container {{
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                }}
+                
+                .volume-slider {{
+                    width: 80px;
+                    height: 4px;
+                    background: rgba(255,255,255,0.3);
+                    border-radius: 2px;
+                    outline: none;
+                    cursor: pointer;
+                }}
+                
+                .fullscreen {{
+                    background: none;
+                    border: none;
+                    color: #ccc;
+                    font-size: 20px;
+                    cursor: pointer;
+                    padding: 5px;
+                }}
+                
+                .loading {{
+                    position: absolute;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    color: #ccc;
+                    font-size: 16px;
+                }}
+                
+                .error {{
+                    position: absolute;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    color: #ff6b6b;
+                    text-align: center;
+                    max-width: 400px;
+                }}
+                
+                .download-btn {{
+                    position: absolute;
+                    top: 20px;
+                    right: 20px;
+                    background: rgba(0,0,0,0.7);
+                    color: white;
+                    border: 1px solid #555;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    text-decoration: none;
+                    font-size: 14px;
+                    transition: background 0.2s ease;
+                }}
+                
+                .download-btn:hover {{
+                    background: rgba(0,0,0,0.9);
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="player-container">
+                <div class="video-wrapper">
+                    <video id="videoPlayer" preload="metadata" controls>
+                        <source src="{html.escape(stream_url)}" type="{self._get_video_mime_type(filename)}">
+                        Your browser does not support the video tag.
+                    </video>
+                    <div class="loading" id="loading">Loading video...</div>
+                    <div class="error" id="error" style="display: none;"></div>
+                </div>
+                
+                <div class="controls">
+                    <button class="play-pause" id="playPause">▶</button>
+                    <div class="progress-container" id="progressContainer">
+                        <div class="progress-bar" id="progressBar"></div>
+                    </div>
+                    <div class="time-display" id="timeDisplay">0:00 / 0:00</div>
+                    <div class="volume-container">
+                        <span>🔊</span>
+                        <input type="range" class="volume-slider" id="volumeSlider" min="0" max="1" step="0.1" value="1">
+                    </div>
+                    <button class="fullscreen" id="fullscreen">⛶</button>
+                </div>
+                
+                <a href="{base_url}/d?token={urllib.parse.quote(token)}" class="download-btn">Download</a>
+            </div>
+            
+            <script>
+                const video = document.getElementById('videoPlayer');
+                const playPause = document.getElementById('playPause');
+                const progressBar = document.getElementById('progressBar');
+                const progressContainer = document.getElementById('progressContainer');
+                const timeDisplay = document.getElementById('timeDisplay');
+                const volumeSlider = document.getElementById('volumeSlider');
+                const fullscreen = document.getElementById('fullscreen');
+                const loading = document.getElementById('loading');
+                const error = document.getElementById('error');
+                
+                let isPlaying = false;
+                
+                // Play/Pause functionality
+                playPause.addEventListener('click', () => {{
+                    if (isPlaying) {{
+                        video.pause();
+                    }} else {{
+                        video.play();
+                    }}
+                }});
+                
+                video.addEventListener('play', () => {{
+                    isPlaying = true;
+                    playPause.textContent = '⏸';
+                    loading.style.display = 'none';
+                }});
+                
+                video.addEventListener('pause', () => {{
+                    isPlaying = false;
+                    playPause.textContent = '▶';
+                }});
+                
+                // Progress bar
+                video.addEventListener('timeupdate', () => {{
+                    const progress = (video.currentTime / video.duration) * 100;
+                    progressBar.style.width = progress + '%';
+                    
+                    const currentTime = formatTime(video.currentTime);
+                    const duration = formatTime(video.duration);
+                    timeDisplay.textContent = `${{currentTime}} / ${{duration}}`;
+                }});
+                
+                progressContainer.addEventListener('click', (e) => {{
+                    const rect = progressContainer.getBoundingClientRect();
+                    const clickX = e.clientX - rect.left;
+                    const width = rect.width;
+                    const clickTime = (clickX / width) * video.duration;
+                    video.currentTime = clickTime;
+                }});
+                
+                // Volume control
+                volumeSlider.addEventListener('input', (e) => {{
+                    video.volume = e.target.value;
+                }});
+                
+                // Fullscreen
+                fullscreen.addEventListener('click', () => {{
+                    if (document.fullscreenElement) {{
+                        document.exitFullscreen();
+                    }} else {{
+                        video.requestFullscreen();
+                    }}
+                }});
+                
+                // Error handling
+                video.addEventListener('error', (e) => {{
+                    loading.style.display = 'none';
+                    error.style.display = 'block';
+                    error.innerHTML = 'Error loading video. Please try downloading the file instead.';
+                }});
+                
+                video.addEventListener('loadeddata', () => {{
+                    loading.style.display = 'none';
+                }});
+                
+                // Keyboard shortcuts
+                document.addEventListener('keydown', (e) => {{
+                    switch(e.code) {{
+                        case 'Space':
+                            e.preventDefault();
+                            if (isPlaying) video.pause();
+                            else video.play();
+                            break;
+                        case 'ArrowLeft':
+                            video.currentTime -= 10;
+                            break;
+                        case 'ArrowRight':
+                            video.currentTime += 10;
+                            break;
+                        case 'KeyF':
+                            if (document.fullscreenElement) {{
+                                document.exitFullscreen();
+                            }} else {{
+                                video.requestFullscreen();
+                            }}
+                            break;
+                    }}
+                }});
+                
+                function formatTime(seconds) {{
+                    const mins = Math.floor(seconds / 60);
+                    const secs = Math.floor(seconds % 60);
+                    return `${{mins}}:${{secs.toString().padStart(2, '0')}}`;
+                }}
+                
+                // Auto-hide controls
+                let controlsTimeout;
+                const controls = document.querySelector('.controls');
+                
+                function showControls() {{
+                    controls.style.opacity = '1';
+                    clearTimeout(controlsTimeout);
+                    controlsTimeout = setTimeout(() => {{
+                        if (isPlaying) {{
+                            controls.style.opacity = '0';
+                        }}
+                    }}, 3000);
+                }}
+                
+                document.addEventListener('mousemove', showControls);
+                video.addEventListener('play', showControls);
+            </script>
+        </body>
+        </html>
+        """
+        
+        return web.Response(text=html_content, content_type='text/html')
+    
+    async def handle_video_info(self, request: web.Request) -> web.Response:
+        """Get video file information for the player"""
+        token = request.query.get('token')
+        if not token:
+            return web.Response(status=400, text='Missing token')
+        
+        path = self.verify_token(token)
+        if not path:
+            return web.Response(status=403, text='Invalid or expired token')
+        
+        filename = path.rsplit('/', 1)[-1]
+        if not self._is_video_file(filename):
+            return web.Response(status=400, text='File is not a supported video format')
+        
+        # Get file info via SFTP
         loop = asyncio.get_running_loop()
-
-        # Get file size first
-        def _stat_sync() -> Tuple[int, Optional[Exception]]:
+        
+        def get_file_info():
             sftp = None
             try:
                 sftp = self.scanner._connect()
-                size = sftp.stat(path).st_size
-                return size, None
+                stat = sftp.stat(path)
+                return {
+                    'filename': filename,
+                    'size': stat.st_size,
+                    'mime_type': self._get_video_mime_type(filename),
+                    'needs_transcoding': self._needs_transcoding(filename)
+                }
             except Exception as e:
-                return 0, e
+                raise Exception(f"Failed to get file info: {str(e)}")
             finally:
-                try:
-                    if sftp:
-                        sftp.close()
-                except Exception:
-                    pass
-
-        size, err = await loop.run_in_executor(None, _stat_sync)
-        if err is not None:
+                if sftp:
+                    sftp.close()
+        
+        try:
+            info = await loop.run_in_executor(None, get_file_info)
+            return web.json_response(info)
+        except Exception as e:
+            return web.Response(status=500, text=str(e))
+    
+    async def handle_video_stream(self, request: web.Request) -> web.StreamResponse:
+        """Stream video file with proper transcoding if needed"""
+        token = request.query.get('token')
+        if not token:
+            return web.Response(status=400, text='Missing token')
+        
+        path = self.verify_token(token)
+        if not path:
+            return web.Response(status=403, text='Invalid or expired token')
+        
+        filename = path.rsplit('/', 1)[-1]
+        if not self._is_video_file(filename):
+            return web.Response(status=400, text='File is not a supported video format')
+        
+        # Check if we need transcoding
+        if self._needs_transcoding(filename) and self.cfg.enable_video_player:
+            return await self._stream_with_transcoding(path, filename, request)
+        else:
+            return await self._stream_direct(path, filename, request)
+    
+    async def _stream_direct(self, path: str, filename: str, request: web.Request) -> web.StreamResponse:
+        """Stream video file directly without transcoding"""
+        mime_type = self._get_video_mime_type(filename)
+        
+        # Get file size
+        loop = asyncio.get_running_loop()
+        
+        def get_file_size():
+            sftp = None
+            try:
+                sftp = self.scanner._connect()
+                return sftp.stat(path).st_size
+            finally:
+                if sftp:
+                    sftp.close()
+        
+        try:
+            file_size = await loop.run_in_executor(None, get_file_size)
+        except Exception:
             return web.Response(status=404, text='File not found')
-
-        # Range handling
+        
+        # Handle range requests for video seeking
         range_header = request.headers.get('Range')
         start = 0
-        end = size - 1
+        end = file_size - 1
         status = 200
+        
         headers = {
-            'Content-Type': mime,
+            'Content-Type': mime_type,
             'Accept-Ranges': 'bytes',
             'Content-Disposition': f"inline; filename*=UTF-8''{urllib.parse.quote(filename)}",
         }
+        
         if range_header and range_header.startswith('bytes='):
             try:
                 spec = range_header.split('=')[1]
@@ -798,49 +952,32 @@ class LinkServer:
                     start = int(s)
                 if e:
                     end = int(e)
-                if end >= size:
-                    end = size - 1
+                if end >= file_size:
+                    end = file_size - 1
                 if start > end:
                     return web.Response(status=416, text='Requested Range Not Satisfiable')
                 status = 206
-                headers['Content-Range'] = f'bytes {start}-{end}/{size}'
+                headers['Content-Range'] = f'bytes {start}-{end}/{file_size}'
                 headers['Content-Length'] = str(end - start + 1)
             except Exception:
-                # Malformed range; ignore
-                headers['Content-Length'] = str(size)
+                headers['Content-Length'] = str(file_size)
         else:
-            headers['Content-Length'] = str(size)
-
+            headers['Content-Length'] = str(file_size)
+        
         resp = web.StreamResponse(status=status, reason='OK', headers=headers)
         await resp.prepare(request)
-
-        # For HEAD requests, do not stream body and do not consume the token
-        if request.method.upper() == 'HEAD':
-            try:
-                await resp.write_eof()
-            except Exception:
-                pass
-            return resp
-
-        queue: asyncio.Queue = asyncio.Queue(maxsize=10)
+        
+        # Stream file content
+        queue = asyncio.Queue(maxsize=10)
         stop_flag = {"stop": False}
-
-        def producer_range():
+        
+        def producer():
             sftp = None
             try:
                 sftp = self.scanner._connect()
                 with sftp.open(path, 'rb') as f:
-                    # Seek to start position
                     if start > 0:
-                        try:
-                            f.seek(start)
-                        except Exception:
-                            remaining = start
-                            while remaining > 0:
-                                chunk = f.read(min(64 * 1024, remaining))
-                                if not chunk:
-                                    break
-                                remaining -= len(chunk)
+                        f.seek(start)
                     pos = start
                     limit = end
                     while not stop_flag['stop'] and pos <= limit:
@@ -856,28 +993,21 @@ class LinkServer:
                             break
             finally:
                 try:
-                    fut = asyncio.run_coroutine_threadsafe(queue.put(None), loop)  # type: ignore
+                    fut = asyncio.run_coroutine_threadsafe(queue.put(None), loop)
                     fut.result(timeout=2)
                 except Exception:
                     pass
-                try:
-                    if sftp:
-                        sftp.close()
-                except Exception:
-                    pass
-
-        _ = loop.run_in_executor(None, producer_range)
-
+                if sftp:
+                    sftp.close()
+        
+        loop.run_in_executor(None, producer)
+        
         try:
             while True:
                 chunk = await queue.get()
                 if chunk is None:
                     break
                 try:
-                    # Consume a token use on first successful write
-                    if stop_flag['stop'] is False and queue.qsize() == 0:
-                        # consume once per response
-                        self._consume_single_use_token(token)
                     await resp.write(chunk)
                 except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
                     stop_flag['stop'] = True
@@ -887,4 +1017,122 @@ class LinkServer:
                 await resp.write_eof()
             except Exception:
                 pass
+        
         return resp
+    
+    async def _stream_with_transcoding(self, path: str, filename: str, request: web.Request) -> web.StreamResponse:
+        """Stream video with FFmpeg transcoding for browser compatibility"""
+        if not self.cfg.enable_video_player:
+            return web.Response(status=403, text='Video player disabled')
+        
+        # Prepare response headers for MP4 output
+        headers = {
+            'Content-Type': 'video/mp4',
+            'Content-Disposition': f"inline; filename*=UTF-8''{urllib.parse.quote(filename.rsplit('.', 1)[0] + '.mp4')}",
+            'Accept-Ranges': 'none',  # Can't seek in transcoded stream
+        }
+        
+        resp = web.StreamResponse(status=200, reason='OK', headers=headers)
+        await resp.prepare(request)
+        
+        loop = asyncio.get_running_loop()
+        
+        # FFmpeg command for transcoding to MP4
+        cmd = [
+            self.cfg.ffmpeg_path,
+            '-hide_banner', '-loglevel', 'error',
+            '-i', 'pipe:0',
+            '-c:v', 'libx264',  # H.264 for broad compatibility
+            '-preset', 'fast',  # Fast encoding for streaming
+            '-crf', '23',       # Good quality/size balance
+            '-c:a', 'aac',      # AAC audio
+            '-b:a', '128k',     # Audio bitrate
+            '-movflags', '+faststart+frag_keyframe+empty_moov',  # Progressive download
+            '-f', 'mp4',
+            'pipe:1',
+        ]
+        
+        async def run_ffmpeg():
+            # Launch FFmpeg process
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            
+            # Producer: read from SFTP and feed FFmpeg
+            stop_flag = {'stop': False}
+            
+            def feeder():
+                sftp = None
+                try:
+                    sftp = self.scanner._connect()
+                    with sftp.open(path, 'rb') as f:
+                        while not stop_flag['stop']:
+                            chunk = f.read(128 * 1024)
+                            if not chunk:
+                                break
+                            try:
+                                if proc.stdin is not None:
+                                    proc.stdin.write(chunk)
+                            except Exception:
+                                break
+                finally:
+                    try:
+                        if proc.stdin:
+                            proc.stdin.close()
+                    except Exception:
+                        pass
+                    if sftp:
+                        sftp.close()
+            
+            feeder_future = loop.run_in_executor(None, feeder)
+            
+            try:
+                # Consumer: stream FFmpeg output to client
+                if proc.stdout is not None:
+                    while True:
+                        chunk = await proc.stdout.read(64 * 1024)
+                        if not chunk:
+                            break
+                        try:
+                            await resp.write(chunk)
+                        except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
+                            break
+            finally:
+                stop_flag['stop'] = True
+                try:
+                    await feeder_future
+                except Exception:
+                    pass
+                try:
+                    if proc.stdout:
+                        proc.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    if proc.stderr:
+                        proc.stderr.close()
+                except Exception:
+                    pass
+                try:
+                    if proc.stdin:
+                        proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+        
+        try:
+            await run_ffmpeg()
+        finally:
+            try:
+                await resp.write_eof()
+            except Exception:
+                pass
+        
+        return resp
+
