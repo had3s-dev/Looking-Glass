@@ -63,6 +63,10 @@ class Config:
     video_cache_seconds: int
     max_concurrent_streams: int
 
+    # App behavior for public deployment
+    enable_prefix_commands: bool
+    log_level: str
+
 
 
 def getenv_int(name: str, default: int) -> int:
@@ -165,4 +169,6 @@ def load_config() -> Config:
         ffmpeg_path=os.getenv("FFMPEG_PATH", "ffmpeg"),
         video_cache_seconds=getenv_int("VIDEO_CACHE_SECONDS", 3600),
         max_concurrent_streams=getenv_int("MAX_CONCURRENT_STREAMS", 3),
+        enable_prefix_commands=os.getenv("ENABLE_PREFIX_COMMANDS", "false").lower() in ("1", "true", "yes"),
+        log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
     )

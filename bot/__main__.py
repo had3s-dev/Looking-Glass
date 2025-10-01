@@ -17,12 +17,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("discord-seedbox-bot")
 
 
-INTENTS = discord.Intents.default()
-INTENTS.message_content = True
+ 
 
 
 def build_bot(cfg: Config) -> commands.Bot:
-    bot = commands.Bot(command_prefix=cfg.command_prefix, intents=INTENTS, help_command=None)
+    intents = discord.Intents.default()
+    # Request message content only when prefix commands are desired
+    if getattr(cfg, "enable_prefix_commands", False):
+        intents.message_content = True
+    bot = commands.Bot(command_prefix=cfg.command_prefix, intents=intents, help_command=None)
 
     cache = LibraryCache(max_age_seconds=cfg.cache_ttl_seconds)
     movies_cache: LibraryCache = LibraryCache(max_age_seconds=cfg.cache_ttl_seconds)
@@ -64,7 +67,7 @@ def build_bot(cfg: Config) -> commands.Bot:
         if (_time.time() - _last_sync_ts) < 60:
             return
         try:
-            browse_cmd = app_commands.Command(name="browse", description="Browse Books/Movies/TV/Music and get link pages", callback=browse_slash)
+            browse_cmd = app_commands.Command(name="browse", description="Browse Books/Movies/TV/Music (ephemeral)", callback=browse_slash)
             folders_cmd = app_commands.Command(name="folders", description="(Owner) Export Movies/TV top-level folders as text files", callback=folders_slash)
             list_cmd = app_commands.Command(name="list", description="(Owner) Export full file lists for Movies/TV as text files", callback=list_slash)
             devbadge_cmd = app_commands.Command(name="devbadge", description="(Owner) Get the link to claim the Active Developer badge", callback=devbadge_slash)
@@ -89,18 +92,20 @@ def build_bot(cfg: Config) -> commands.Bot:
                     except Exception:
                         logger.exception(f"Failed to clear commands for guild {gid}")
                     bot.tree.add_command(browse_cmd, guild=guild_obj)
-                    bot.tree.add_command(folders_cmd, guild=guild_obj)
-                    bot.tree.add_command(list_cmd, guild=guild_obj)
-                    bot.tree.add_command(devbadge_cmd, guild=guild_obj)
+                    if cfg.owner_user_id is not None:
+                        bot.tree.add_command(folders_cmd, guild=guild_obj)
+                        bot.tree.add_command(list_cmd, guild=guild_obj)
+                        bot.tree.add_command(devbadge_cmd, guild=guild_obj)
                     synced = await bot.tree.sync(guild=guild_obj)
                     logger.info(f"Slash commands synced for guild {gid}: {[c.name for c in synced]}")
             else:
                 # Global-only mode: clear and re-add globally
                 bot.tree.clear_commands(guild=None)
                 bot.tree.add_command(browse_cmd)
-                bot.tree.add_command(folders_cmd)
-                bot.tree.add_command(list_cmd)
-                bot.tree.add_command(devbadge_cmd)
+                if cfg.owner_user_id is not None:
+                    bot.tree.add_command(folders_cmd)
+                    bot.tree.add_command(list_cmd)
+                    bot.tree.add_command(devbadge_cmd)
                 synced = await bot.tree.sync()
                 logger.info(f"Global slash commands synced: {[c.name for c in synced]}")
             _last_sync_ts = _time.time()
@@ -109,10 +114,15 @@ def build_bot(cfg: Config) -> commands.Bot:
 
     @bot.event
     async def on_ready():
-        logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-        # Set a fun status
+        # Apply runtime log level
         try:
-            activity = discord.Game(name="in the library | !help")
+            logging.getLogger().setLevel(getattr(logging, (cfg.log_level or "INFO"), logging.INFO))
+        except Exception:
+            pass
+        logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
+        # Presence highlights the public /browse command
+        try:
+            activity = discord.Activity(type=discord.ActivityType.watching, name="/browse your library")
             await bot.change_presence(status=discord.Status.online, activity=activity)
             logger.info("Updated bot presence")
         except Exception:
@@ -134,6 +144,8 @@ def build_bot(cfg: Config) -> commands.Bot:
                     host_display = cfg.http_host if cfg.http_host != '0.0.0.0' else '127.0.0.1'
                     base_link_url = f"http://{host_display}:{cfg.http_port}"
                 logger.info(f"HTTP link server started at {base_link_url}")
+                if cfg.public_base_url and not cfg.link_secret:
+                    logger.warning("PUBLIC_BASE_URL is set but LINK_SECRET is not configured. Signed links will use a weak default secret. Set LINK_SECRET for production.")
         except Exception:
             logger.exception("Failed to start HTTP link server")
 
@@ -286,16 +298,8 @@ def build_bot(cfg: Config) -> commands.Bot:
             rescan_callback=rescan_callback,
         )
 
-    # Slash command providing the same UI, but as an ephemeral message
+    # Slash command providing the same UI, ephemerally to the invoker only (public)
     async def browse_slash(interaction: discord.Interaction):
-        # Channel gate for interactions
-        if allowed_channel_id is not None:
-            try:
-                if interaction.channel_id != allowed_channel_id:
-                    await interaction.response.send_message("This command is not available in this channel.", ephemeral=True)
-                    return
-            except Exception:
-                pass
         if not cfg.enable_http_links:
             await interaction.response.send_message("HTTP links are disabled. Set ENABLE_HTTP_LINKS=true.", ephemeral=True)
             return

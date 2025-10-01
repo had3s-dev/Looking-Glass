@@ -2,7 +2,8 @@
 
 A Discord bot you can deploy to Railway that lists your Books/Movies/TV/Music from your Whatbox seedbox and shares expiring links via a lightweight HTTP server.
 
-- Commands: `!browseall` (unified categories UI), `!getbook <author> | <book title>`, `!update`, `!help`
+- Slash commands: `/browse` (unified categories UI, ephemeral)
+- Optional prefix commands: `!browseall`, `!update`, `!help`
 - Optional downloads: `!getbook <author> | <book title>` (small files only; see config)
 - SFTP scanning of your library with flexible layout handling
 - Automatic background refresh every 30 minutes and manual `!update`
@@ -23,10 +24,10 @@ Extensions default to: `.epub,.mobi,.pdf,.azw3` for books, common video formats 
 
 ## Commands
 
-- `!browseall` – Open a single browse UI in Discord with categories (Books/Movies/TV/Music). Selecting an item provides a link page with expiring, signed download links.
-- `!update` – Force a rescan of the library.
-- `!help` – Show command help.
-- `!getbook <author> | <book title>` – Download and upload a book file if downloads are enabled and the file is under the configured upload size.
+- `/browse` – Open a single browse UI in Discord with categories (Books/Movies/TV/Music). Selecting an item sends you a DM with links when possible, and always includes a button to open a signed links page. Replies are ephemeral and only visible to you.
+- `!browseall` – Same UI as `/browse` (prefix only, when enabled).
+- `!update` – Force a rescan of the library (prefix only).
+- `!help` – Show command help (prefix only).
 
 ## Configuration
 
@@ -56,6 +57,8 @@ Optional:
 - `ALLOWED_CHANNEL_ID` – If set, restrict commands to a single channel ID.
 - `ENABLE_DOWNLOADS` – `true/false` (default `false`). Enables the `!getbook` command.
 - `MAX_UPLOAD_BYTES` – Max size for upload to Discord (default `8000000` i.e. ~8MB). Note: Discord server limits may apply depending on Nitro/boost level.
+ - `ENABLE_PREFIX_COMMANDS` – `true/false` (default `false`). Enables legacy `!` commands and requests Message Content intent.
+ - `LOG_LEVEL` – `DEBUG|INFO|WARNING|ERROR` (default `INFO`).
 
 ## Local Run
 
@@ -73,19 +76,20 @@ pip install -r requirements.txt
 python -m bot
 ```
 
-## Deploy on Railway
+## Deploy for Public Use
 
 1. Create a new Railway project and connect your repo, or upload this folder.
-2. Set these environment variables in Railway:
+2. Set these environment variables:
    - `DISCORD_TOKEN`
    - `SFTP_HOST`
    - `SFTP_USERNAME`
    - `SFTP_PASSWORD` or configure a variable with your private key file path; see note below.
    - `LIBRARY_ROOT_PATH`
-   - Optionally: `SFTP_PORT`, `FILE_EXTENSIONS`, `COMMAND_PREFIX`, `PAGE_SIZE`, `CACHE_TTL_SECONDS`
-   - For video player: `ENABLE_VIDEO_PLAYER=true`, `ENABLE_HTTP_LINKS=true`
+   - Optionally: `SFTP_PORT`, `FILE_EXTENSIONS`, `COMMAND_PREFIX`, `PAGE_SIZE`, `CACHE_TTL_SECONDS`, `ENABLE_PREFIX_COMMANDS=false`, `LOG_LEVEL=INFO`
+   - For video and links: `ENABLE_HTTP_LINKS=true`, optionally `ENABLE_VIDEO_PLAYER=true`
    - For video transcoding: `FFMPEG_PATH=ffmpeg` (Railway provides this automatically)
-3. Railway will detect the `Procfile` and run `worker: python -m bot`.
+   - If exposing publicly via proxy: `PUBLIC_BASE_URL=https://your.domain`, and set `LINK_SECRET` to a strong random string
+3. Your host will detect the `Procfile` and run `worker: python -m bot`.
 
 ### Using SSH Key Auth on Railway
 
@@ -96,7 +100,7 @@ If you prefer key-based auth, you have two options:
 
 ## Notes
 
-- The unified browse UI provides buttons and link pages. If your guild disables message content intent or buttons, adjust Discord settings accordingly.
+- `/browse` uses only application commands and does not require Message Content intent. Enable prefix commands only if needed.
 - Large libraries: the bot caches results for `CACHE_TTL_SECONDS` to avoid excessive SFTP calls. `!update` bypasses cache and rescans.
 - Movies/TV/Music scanning is optional; leave their root env vars unset to disable those features.
 - Downloads are limited to small files and currently implemented for books only. If you’d like movie/TV/music downloads or link generation (e.g., HTTP links), open an issue or extend the bot accordingly.
@@ -105,6 +109,7 @@ If you prefer key-based auth, you have two options:
 
 - Set `ENABLE_HTTP_LINKS=true` to enable the internal `aiohttp` server that serves a simple links page and signed download endpoints.
 - Configure `HTTP_HOST`, `HTTP_PORT`, `PUBLIC_BASE_URL` (if using a reverse proxy), `LINK_TTL_SECONDS`, and `LINK_SECRET`.
+- Security: If `PUBLIC_BASE_URL` is set and `LINK_SECRET` is missing, the bot will warn and use a weak development secret. Always set a strong `LINK_SECRET` for production.
 
 ### Video Player
 
