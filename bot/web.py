@@ -11,17 +11,16 @@ import zipfile
 from typing import List, Dict, Optional, Tuple
 
 from aiohttp import web
+import aiohttp
 
 from .config import Config
 from .scanner import SeedboxScanner
-from .multi_tenant import TenantManager
 
 
 class LinkServer:
-    def __init__(self, cfg: Config, scanner: SeedboxScanner, tenant: Optional[TenantManager] = None) -> None:
+    def __init__(self, cfg: Config, scanner: SeedboxScanner) -> None:
         self.cfg = cfg
         self.scanner = scanner
-        self.tenant = tenant
         self.app = web.Application()
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
@@ -29,8 +28,6 @@ class LinkServer:
             web.get('/links', self.handle_links),
             web.get('/d', self.handle_download),
             web.get('/', self.handle_root),
-            web.get('/admin', self.handle_admin_page),
-            web.post('/admin/save', self.handle_admin_save),
             web.get('/upload', self.handle_upload_form),
             web.post('/upload', self.handle_upload),
             web.get('/video', self.handle_video_player),
@@ -39,13 +36,6 @@ class LinkServer:
             web.get('/subtitle', self.handle_subtitle),
             web.get('/test-video', self.handle_test_video),
         ]
-        # Guild admin endpoints only if tenant manager is present
-        if self.tenant is not None:
-            routes.extend([
-                web.get('/admin/generate-token', self.handle_admin_generate_token),
-                web.get('/admin/g', self.handle_admin_guild_page),
-                web.post('/admin/g/save', self.handle_admin_guild_save),
-            ])
         self.app.add_routes(routes)
 
     async def start(self):
@@ -76,15 +66,14 @@ class LinkServer:
         return bool(expected and token and hmac.compare_digest(expected, token))
 
     # ---- Signing helpers ----
-    def sign_path(self, path: str, exp_ts: int, guild_id: Optional[int] = None) -> str:
+    def sign_path(self, path: str, exp_ts: int) -> str:
         secret = (self.cfg.link_secret or 'dev-secret').encode('utf-8')
-        payload_plain = f"{int(guild_id or 0)}|{path}"
-        token = base64.urlsafe_b64encode(payload_plain.encode('utf-8')).decode('utf-8')
+        token = base64.urlsafe_b64encode(path.encode('utf-8')).decode('utf-8')
         payload = f"{token}.{exp_ts}".encode('utf-8')
         sig = hmac.new(secret, payload, hashlib.sha256).hexdigest()
         return f"{token}.{exp_ts}.{sig}"
 
-    def verify_token(self, token: str) -> Optional[Tuple[Optional[int], str]]:
+    def verify_token(self, token: str) -> Optional[str]:
         try:
             token_b64, exp_s, sig = token.split('.')
             exp_ts = int(exp_s)
@@ -99,242 +88,17 @@ class LinkServer:
         if not hmac.compare_digest(expected, sig):
             return None
         try:
-            decoded = base64.urlsafe_b64decode(token_b64.encode('utf-8')).decode('utf-8')
-            if '|' in decoded:
-                gid_str, path = decoded.split('|', 1)
-                try:
-                    gid_val = int(gid_str)
-                except Exception:
-                    gid_val = 0
-                return (gid_val if gid_val != 0 else None, path)
-            else:
-                # Backward compatibility: old tokens had only path
-                return (None, decoded)
+            path = base64.urlsafe_b64decode(token_b64.encode('utf-8')).decode('utf-8')
+            return path
         except Exception:
             return None
 
 
 
     # ---- Routes ----
-    async def handle_admin_page(self, request: web.Request) -> web.Response:
-        if not self._is_admin(request):
-            return web.Response(status=401, text='Unauthorized')
-        # Very simple JSON form
-        html_page = """
-        <!doctype html>
-        <html>
-        <head>
-            <meta charset="utf-8" />
-            <title>Looking-Glass Admin</title>
-            <style> body { font-family: system-ui, sans-serif; max-width: 920px; margin: 32px auto; }
-            input, select, textarea { width: 100%; padding: 8px; margin: 6px 0 12px; }
-            label { font-weight: 600; }
-            .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-            .row > div { }
-            button { padding: 10px 16px; }
-            pre { background:#111; color:#eee; padding:12px; overflow:auto; }
-            </style>
-        </head>
-        <body>
-            <h1>Looking-Glass Admin</h1>
-            <p>Edit runtime config below and click Save. A bot restart is not required for most settings.</p>
-            <div id="status"></div>
-            <textarea id="config" rows="28" spellcheck="false"></textarea>
-            <div>
-                <button id="save">Save</button>
-            </div>
-            <h3>Tips</h3>
-            <ul>
-              <li>Set <code>public_base_url</code> and <code>link_secret</code> for public installs.</li>
-              <li>Set <code>enable_http_links</code> and (optional) <code>enable_video_player</code>.</li>
-              <li>SFTP: <code>sftp_host</code>, <code>sftp_port</code>, <code>sftp_username</code>, password or <code>ssh_key_path</code>.</li>
-            </ul>
-            <script>
-              const token = new URLSearchParams(location.search).get('token');
-              const cfgEl = document.getElementById('config');
-              const statusEl = document.getElementById('status');
-              const initial = {
-                sftp_host: "{sftp_host}",
-                sftp_port: {sftp_port},
-                sftp_username: "{sftp_username}",
-                library_root_path: "{lib_root}",
-                movies_root_path: "{movies_root}",
-                tv_root_path: "{tv_root}",
-                music_root_path: "{music_root}",
-                enable_http_links: {enable_http_links},
-                public_base_url: "{public_base_url}",
-                link_secret: "",
-                link_ttl_seconds: {link_ttl},
-                enable_video_player: {enable_video_player},
-                page_size: {page_size},
-                cache_ttl_seconds: {cache_ttl},
-                log_level: "{log_level}"
-              };
-              cfgEl.value = JSON.stringify(initial, null, 2);
-              document.getElementById('save').onclick = async () => {
-                try {
-                  const res = await fetch('/admin/save' + (token ? ('?token=' + encodeURIComponent(token)) : ''), {
-                    method: 'POST', headers: { 'content-type': 'application/json' }, body: cfgEl.value
-                  });
-                  const text = await res.text();
-                  statusEl.textContent = res.ok ? 'Saved.' : ('Error: ' + text);
-                } catch (e) {
-                  statusEl.textContent = 'Error: ' + e;
-                }
-              };
-            </script>
-        </body>
-        </html>
-        """.format(
-            sftp_host=html.escape(self.cfg.sftp_host or ""),
-            sftp_port=self.cfg.sftp_port,
-            sftp_username=html.escape(self.cfg.sftp_username or ""),
-            lib_root=html.escape(self.scanner.root_path or ""),
-            movies_root=html.escape(self.cfg.movies_root_path or ""),
-            tv_root=html.escape(self.cfg.tv_root_path or ""),
-            music_root=html.escape(self.cfg.music_root_path or ""),
-            enable_http_links=str(bool(self.cfg.enable_http_links)).lower(),
-            public_base_url=html.escape(self.cfg.public_base_url or ""),
-            link_ttl=self.cfg.link_ttl_seconds,
-            enable_video_player=str(bool(self.cfg.enable_video_player)).lower(),
-            page_size=self.cfg.page_size,
-            cache_ttl=self.cfg.cache_ttl_seconds,
-            log_level=html.escape(self.cfg.log_level or "INFO"),
-        )
-        return web.Response(text=html_page, content_type='text/html')
-
-    async def handle_admin_save(self, request: web.Request) -> web.Response:
-        if not self._is_admin(request):
-            return web.Response(status=401, text='Unauthorized')
-        try:
-            body = await request.text()
-            import json, os
-            data = json.loads(body)
-            # Persist to runtime_config.json or configured path
-            path = getattr(self.cfg, 'runtime_config_path', 'runtime_config.json') or 'runtime_config.json'
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
-            # Apply to live config for most keys immediately
-            # Minimal live updates: paths, flags, ttl, page size
-            self.cfg.enable_http_links = bool(data.get('enable_http_links', self.cfg.enable_http_links))
-            self.cfg.public_base_url = data.get('public_base_url', self.cfg.public_base_url)
-            if data.get('link_secret'):
-                self.cfg.link_secret = str(data.get('link_secret'))
-            self.cfg.link_ttl_seconds = int(data.get('link_ttl_seconds', self.cfg.link_ttl_seconds))
-            self.cfg.enable_video_player = bool(data.get('enable_video_player', self.cfg.enable_video_player))
-            self.cfg.page_size = int(data.get('page_size', self.cfg.page_size))
-            self.cfg.cache_ttl_seconds = int(data.get('cache_ttl_seconds', self.cfg.cache_ttl_seconds))
-            # Update scanner roots live
-            new_books_root = data.get('library_root_path')
-            if isinstance(new_books_root, str) and new_books_root:
-                self.scanner.root_path = new_books_root
-            for attr, key in (("movies_root_path", "movies_root_path"),("tv_root_path","tv_root_path"),("music_root_path","music_root_path")):
-                val = data.get(key)
-                if isinstance(val, str) or val is None:
-                    setattr(self.cfg, attr, val)
-            return web.Response(text='OK')
-        except Exception as e:
-            return web.Response(status=400, text=str(e))
 
     # --- Multi-tenant admin helpers ---
-    async def handle_admin_generate_token(self, request: web.Request) -> web.Response:
-        if not self._is_admin(request) or self.tenant is None:
-            return web.Response(status=401, text='Unauthorized')
-        try:
-            gid = int(request.query.get('guild_id', '0'))
-            tok = self.tenant.create_admin_token(gid)
-            return web.json_response({"token": tok, "expires_in": 900, "guild_id": gid})
-        except Exception as e:
-            return web.Response(status=400, text=str(e))
-
-    async def handle_admin_guild_page(self, request: web.Request) -> web.Response:
-        if self.tenant is None:
-            return web.Response(status=404, text='Not available')
-        tok = request.query.get('token')
-        gid = self.tenant.validate_admin_token(tok)
-        if gid is None:
-            return web.Response(status=401, text='Unauthorized')
-        params = self.tenant.get_effective_params(gid)
-        html_page = """
-        <!doctype html>
-        <html>
-        <head><meta charset='utf-8'><title>Guild Admin</title>
-        <style> body{font-family:system-ui,sans-serif;max-width:920px;margin:32px auto;} input,textarea{width:100%;padding:8px;margin:6px 0 12px} </style>
-        </head>
-        <body>
-          <h1>Guild Settings</h1>
-          <p>Configure this server's seedbox settings. Leave fields blank to inherit the default.</p>
-          <div id='status'></div>
-          <label>SFTP Host</label>
-          <input id='sftp_host' value="{sftp_host}">
-          <label>SFTP Port</label>
-          <input id='sftp_port' type='number' value="{sftp_port}">
-          <label>Username</label>
-          <input id='sftp_username' value="{sftp_username}">
-          <label>Password</label>
-          <input id='sftp_password' type='password' value="">
-          <label>SSH Key Path (on host)</label>
-          <input id='ssh_key_path' value="{ssh_key_path}">
-          <label>Books Root Path</label>
-          <input id='library_root_path' value="{lib_root}">
-          <label>Movies Root Path</label>
-          <input id='movies_root_path' value="{movies_root}">
-          <label>TV Root Path</label>
-          <input id='tv_root_path' value="{tv_root}">
-          <label>Music Root Path</label>
-          <input id='music_root_path' value="{music_root}">
-          <button id='save'>Save</button>
-          <script>
-            const token = new URLSearchParams(location.search).get('token');
-            const gid = {gid};
-            function val(id){return document.getElementById(id).value}
-            document.getElementById('save').onclick = async () => {
-              const body = {
-                sftp_host: val('sftp_host')||null,
-                sftp_port: Number(val('sftp_port'))||null,
-                sftp_username: val('sftp_username')||null,
-                sftp_password: val('sftp_password')||null,
-                ssh_key_path: val('ssh_key_path')||null,
-                library_root_path: val('library_root_path')||null,
-                movies_root_path: val('movies_root_path')||null,
-                tv_root_path: val('tv_root_path')||null,
-                music_root_path: val('music_root_path')||null,
-              };
-              try{
-                const res = await fetch('/admin/g/save?token='+encodeURIComponent(token)+'&guild_id='+gid,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
-                document.getElementById('status').textContent = res.ok ? 'Saved' : ('Error: '+await res.text());
-              }catch(e){ document.getElementById('status').textContent = 'Error: '+e; }
-            };
-          </script>
-        </body>
-        </html>
-        """.format(
-            sftp_host=html.escape(params.get('sftp_host') or ''),
-            sftp_port=int(params.get('sftp_port') or 22),
-            sftp_username=html.escape(params.get('sftp_username') or ''),
-            ssh_key_path=html.escape(params.get('ssh_key_path') or ''),
-            lib_root=html.escape(params.get('library_root_path') or ''),
-            movies_root=html.escape(params.get('movies_root_path') or ''),
-            tv_root=html.escape(params.get('tv_root_path') or ''),
-            music_root=html.escape(params.get('music_root_path') or ''),
-            gid=int(gid),
-        )
-        return web.Response(text=html_page, content_type='text/html')
-
-    async def handle_admin_guild_save(self, request: web.Request) -> web.Response:
-        if self.tenant is None:
-            return web.Response(status=404, text='Not available')
-        tok = request.query.get('token')
-        gid = self.tenant.validate_admin_token(tok)
-        if gid is None:
-            return web.Response(status=401, text='Unauthorized')
-        try:
-            import json
-            data = await request.json()
-            self.tenant.update_guild_config(int(gid), data)
-            return web.Response(text='OK')
-        except Exception as e:
-            return web.Response(status=400, text=str(e))
+    # Removed tenant endpoints in single-tenant mode
     async def handle_upload_form(self, request: web.Request) -> web.Response:
         content = """
             <!DOCTYPE html>
@@ -448,15 +212,11 @@ class LinkServer:
     async def handle_root(self, request: web.Request) -> web.Response:
         return web.Response(text="OK", content_type='text/plain')
 
+    # --- Public Onboarding (OAuth) ---
+
     async def handle_links(self, request: web.Request) -> web.Response:
         kind = request.query.get('kind', '')
         name = request.query.get('name', '')
-        guild_id = request.query.get('guild_id')
-        gid: Optional[int] = None
-        try:
-            gid = int(guild_id) if guild_id is not None else None
-        except Exception:
-            gid = None
         if kind not in ('books', 'movies', 'tv', 'music'):
             return web.Response(status=400, text='Invalid kind')
         if not name:
@@ -474,7 +234,7 @@ class LinkServer:
         exp = int(time.time()) + self.cfg.link_ttl_seconds
         items = []
         for path, size in files:
-            token = self.sign_path(path, exp, gid)
+            token = self.sign_path(path, exp)
             url = f"{base}/d?token={urllib.parse.quote(token)}"
             items.append((path.rsplit('/', 1)[-1], url, size))
 
@@ -483,7 +243,7 @@ class LinkServer:
         video_items: List[Tuple[str, str, int]] = []
         if kind in ('movies', 'tv') and self.cfg.enable_video_player:
             try:
-                video_items = self.build_video_links(kind, name, gid)
+                video_items = self.build_video_links(kind, name)
             except Exception:
                 video_items = []
 
@@ -513,7 +273,7 @@ class LinkServer:
         
         return web.Response(text="\n".join(body), content_type='text/html')
 
-    def build_links(self, kind: str, name: str, guild_id: Optional[int] = None) -> List[Tuple[str, str, int]]:
+    def build_links(self, kind: str, name: str) -> List[Tuple[str, str, int]]:
         """
         Build signed direct-download links for a given kind/name selection.
         Returns a list of tuples: (filename, url, size_bytes).
@@ -528,12 +288,12 @@ class LinkServer:
         exp = int(time.time()) + self.cfg.link_ttl_seconds
         items: List[Tuple[str, str, int]] = []
         for path, size in files:
-            token = self.sign_path(path, exp, guild_id)
+            token = self.sign_path(path, exp)
             url = f"{base}/d?token={urllib.parse.quote(token)}"
             items.append((path.rsplit('/', 1)[-1], url, size))
         return items
 
-    def build_video_links(self, kind: str, name: str, guild_id: Optional[int] = None) -> List[Tuple[str, str, int]]:
+    def build_video_links(self, kind: str, name: str) -> List[Tuple[str, str, int]]:
         """
         Build video player links for Movies/TV selection.
         Returns a list of tuples: (filename, url, size_bytes).
@@ -552,7 +312,7 @@ class LinkServer:
             filename = path.rsplit('/', 1)[-1]
             # Only include video files
             if self._is_video_file(filename):
-                token = self.sign_path(path, exp, guild_id)
+                token = self.sign_path(path, exp)
                 url = f"{base}/video?token={urllib.parse.quote(token)}"
                 out.append((filename, url, size))
         
@@ -696,7 +456,7 @@ class LinkServer:
         verified = self.verify_token(token)
         if not verified:
             return web.Response(status=403, text='Invalid or expired token')
-        gid, path = verified
+        path = verified
 
         # Stream file via SFTP in background thread
         resp = web.StreamResponse(status=200, reason='OK', headers={"Content-Type": "application/octet-stream"})
@@ -766,69 +526,59 @@ class LinkServer:
         return any(filename.lower().endswith(ext) for ext in video_extensions)
     
     def _get_video_mime_type(self, filename: str) -> str:
-        """Get MIME type for video file - returns MP4 for transcoded files"""
+        """Prefer MP4 container for best compatibility (remux/transcode target)."""
         lower = filename.lower()
         if lower.endswith('.mp4') or lower.endswith('.m4v'):
             return 'video/mp4'
-        elif lower.endswith('.webm'):
+        if lower.endswith('.webm'):
             return 'video/webm'
-        elif lower.endswith('.mov'):
+        if lower.endswith('.mov'):
             return 'video/quicktime'
-        elif lower.endswith('.mkv') or lower.endswith('.avi'):
-            # MKV and AVI files are transcoded to MP4, so return MP4 MIME type
-            return 'video/mp4'
-        return 'video/mp4'  # Default fallback
+        return 'video/mp4'
     
     def _needs_transcoding(self, filename: str) -> bool:
-        """Check if file needs transcoding for browser compatibility"""
+        """Conservative: MP4/M4V direct, others prefer remux/transcode path."""
         lower = filename.lower()
-        # MKV and AVI typically need transcoding for browser playback
-        # But we'll try direct streaming first if FFmpeg is not available
-        return lower.endswith('.mkv') or lower.endswith('.avi')
+        return not (lower.endswith('.mp4') or lower.endswith('.m4v'))
     
     def _find_subtitle_files(self, video_path: str) -> List[Dict[str, str]]:
-        """Find subtitle files for a video"""
-        import os
-        video_dir = os.path.dirname(video_path)
-        video_name = os.path.splitext(os.path.basename(video_path))[0]
-        
-        subtitle_files = []
-        subtitle_extensions = ['.srt', '.vtt', '.ass', '.ssa']
-        
-        for ext in subtitle_extensions:
-            subtitle_path = os.path.join(video_dir, f"{video_name}{ext}")
-            if os.path.exists(subtitle_path):
-                # Determine language from filename or default to 'en'
+        """Find sidecar subtitles next to the remote video via SFTP."""
+        import posixpath as _pp
+        out: List[Dict[str, str]] = []
+        sftp = None
+        try:
+            sftp = self.scanner._connect()
+            video_dir = _pp.dirname(video_path)
+            video_name = _pp.splitext(_pp.basename(video_path))[0]
+            for e in sftp.listdir_attr(video_dir):
+                name = e.filename
+                base, ext = _pp.splitext(name)
+                ext = ext.lower()
+                if base != video_name:
+                    continue
+                if ext not in ('.srt', '.vtt', '.ass', '.ssa'):
+                    continue
                 lang = 'en'
-                if '.en.' in subtitle_path:
-                    lang = 'en'
-                elif '.es.' in subtitle_path:
-                    lang = 'es'
-                elif '.fr.' in subtitle_path:
-                    lang = 'fr'
-                elif '.de.' in subtitle_path:
-                    lang = 'de'
-                elif '.it.' in subtitle_path:
-                    lang = 'it'
-                elif '.pt.' in subtitle_path:
-                    lang = 'pt'
-                elif '.ru.' in subtitle_path:
-                    lang = 'ru'
-                elif '.ja.' in subtitle_path:
-                    lang = 'ja'
-                elif '.ko.' in subtitle_path:
-                    lang = 'ko'
-                elif '.zh.' in subtitle_path:
-                    lang = 'zh'
-                
-                subtitle_files.append({
-                    'path': subtitle_path,
+                low = name.lower()
+                for code in ('en','es','fr','de','it','pt','ru','ja','ko','zh'):
+                    if f'.{code}.' in low or low.endswith(f'.{code}{ext}'):
+                        lang = code
+                        break
+                out.append({
+                    'path': _pp.join(video_dir, name),
                     'language': lang,
                     'label': f"Subtitle ({lang.upper()})",
-                    'extension': ext
+                    'extension': ext,
                 })
-        
-        return subtitle_files
+        except Exception:
+            pass
+        finally:
+            try:
+                if sftp:
+                    sftp.close()
+            except Exception:
+                pass
+        return out
     
     def _generate_subtitle_tracks(self, subtitle_files: List[Dict[str, str]], token: str, base_url: str) -> str:
         """Generate HTML for subtitle tracks"""
@@ -855,14 +605,15 @@ class LinkServer:
         verified = self.verify_token(token)
         if not verified:
             return web.Response(status=403, text='Invalid or expired token')
-        gid, path = verified
+        path = verified
         
         filename = path.rsplit('/', 1)[-1]
         if not self._is_video_file(filename):
             return web.Response(status=400, text='File is not a supported video format')
         
         base_url = self._base_url()
-        stream_url = f"{base_url}/stream?token={urllib.parse.quote(token)}"
+        default_quality = 'direct' if filename.lower().endswith(('.mp4', '.m4v')) else 'remux'
+        stream_url = f"{base_url}/stream?token={urllib.parse.quote(token)}&quality={urllib.parse.quote(default_quality)}"
         
         # Find subtitle files
         subtitle_files = self._find_subtitle_files(path)
@@ -939,6 +690,8 @@ class LinkServer:
                     font-size: 18px;
                     z-index: 100;
                 }}
+                .controls { position: absolute; left: 20px; bottom: 20px; display: flex; gap: 12px; z-index: 1001; }
+                .controls select, .controls button { background: rgba(0,0,0,0.7); color:#fff; border:1px solid #555; padding:8px 12px; border-radius:4px; }
             </style>
         </head>
         <body>
@@ -958,6 +711,16 @@ class LinkServer:
                         </p>
                     </video-js>
                     <div class="loading" id="loading">Loading video...</div>
+                    <div class="controls">
+                        <select id="quality">
+                            <option value="direct">Direct</option>
+                            <option value="remux">Original (Remux)</option>
+                            <option value="1080p">1080p</option>
+                            <option value="720p">720p</option>
+                            <option value="480p">480p</option>
+                        </select>
+                        <button id="apply">Apply</button>
+                    </div>
                 </div>
                 
                 <a href="{base_url}/d?token={urllib.parse.quote(token)}" class="download-btn">Download</a>
@@ -988,6 +751,8 @@ class LinkServer:
                 }});
                 
                 const loading = document.getElementById('loading');
+                const qualitySel = document.getElementById('quality');
+                const applyBtn = document.getElementById('apply');
                 
                 // Event listeners for debugging
                 player.ready(() => {{
@@ -1074,6 +839,14 @@ class LinkServer:
                             break;
                     }}
                 }});
+                if (applyBtn) {
+                  applyBtn.addEventListener('click', () => {
+                      const url = new URL('{html.escape(stream_url)}');
+                      url.searchParams.set('quality', qualitySel.value);
+                      player.src({ src: url.toString(), type: '{self._get_video_mime_type(filename)}' });
+                      player.play();
+                  });
+                }
             </script>
         </body>
         </html>
@@ -1090,7 +863,7 @@ class LinkServer:
         verified = self.verify_token(token)
         if not verified:
             return web.Response(status=403, text='Invalid or expired token')
-        gid, path = verified
+        path = verified
         
         # Find subtitle files for this video
         subtitle_files = self._find_subtitle_files(path)
@@ -1221,7 +994,7 @@ class LinkServer:
             return web.Response(status=500, text=str(e))
     
     async def handle_video_stream(self, request: web.Request) -> web.StreamResponse:
-        """Stream video file with proper transcoding if needed"""
+        """Stream video file with quality selector: direct, remux, or scaled transcode."""
         token = request.query.get('token')
         if not token:
             return web.Response(status=400, text='Missing token')
@@ -1234,23 +1007,24 @@ class LinkServer:
         if not self._is_video_file(filename):
             return web.Response(status=400, text='File is not a supported video format')
         
-        # Check if we need transcoding for browser compatibility
-        needs_transcoding = self._needs_transcoding(filename)
-        print(f"Stream request for {filename}: needs_transcoding={needs_transcoding}, video_player_enabled={self.cfg.enable_video_player}")
-        
-        if needs_transcoding and self.cfg.enable_video_player:
-            # Check if FFmpeg is available
-            ffmpeg_path = await self._find_ffmpeg()
-            print(f"FFmpeg path: {ffmpeg_path}")
-            if ffmpeg_path:
-                print(f"Using transcoding for {filename}")
-                return await self._stream_with_transcoding(path, filename, request)
-            else:
-                print("FFmpeg not available for MKV/AVI transcoding")
-                return web.Response(status=503, text='Video transcoding not available. Please download the file instead.')
-        else:
-            print(f"Using direct streaming for {filename}")
+        quality = (request.query.get('quality') or '').lower()
+        if quality not in ('direct','remux','1080p','720p','480p'):
+            quality = 'direct' if filename.lower().endswith(('.mp4','.m4v')) else 'remux'
+
+        # Direct path for native MP4/M4V
+        if quality == 'direct' and (filename.lower().endswith('.mp4') or filename.lower().endswith('.m4v')):
             return await self._stream_direct(path, filename, request)
+
+        # FFmpeg required for remux/transcode
+        ffmpeg_path = await self._find_ffmpeg()
+        if not ffmpeg_path:
+            return await self._stream_direct(path, filename, request)
+
+        if quality == 'remux':
+            return await self._stream_remux_to_mp4(path, filename, request, ffmpeg_path)
+
+        target_height = 1080 if quality == '1080p' else 720 if quality == '720p' else 480
+        return await self._stream_with_transcoding(path, filename, request, ffmpeg_path, target_height)
     
     async def _stream_direct(self, path: str, filename: str, request: web.Request) -> web.StreamResponse:
         """Stream video file directly without transcoding"""
@@ -1289,6 +1063,7 @@ class LinkServer:
             'Content-Disposition': f"inline; filename*=UTF-8''{urllib.parse.quote(filename)}",
             'Cache-Control': 'public, max-age=3600',
             'X-Content-Type-Options': 'nosniff',
+            'X-Accel-Buffering': 'no',
         }
         
         print(f"Streaming {filename} with MIME type: {mime_type}")
@@ -1333,7 +1108,7 @@ class LinkServer:
                     pos = start
                     limit = end
                     while not stop_flag['stop'] and pos <= limit:
-                        to_read = min(128 * 1024, (limit - pos + 1))  # Larger chunks
+                        to_read = min(512 * 1024, (limit - pos + 1))
                         chunk = f.read(to_read)
                         if not chunk:
                             break
@@ -1480,208 +1255,183 @@ class LinkServer:
         except Exception as e:
             return web.Response(status=500, text=f"Test failed: {str(e)}")
     
-    async def _stream_with_transcoding(self, path: str, filename: str, request: web.Request) -> web.StreamResponse:
-        """Stream video with FFmpeg transcoding for browser compatibility"""
-        if not self.cfg.enable_video_player:
-            return web.Response(status=403, text='Video player disabled')
-        
-        # Find FFmpeg path
-        ffmpeg_path = await self._find_ffmpeg()
-        if not ffmpeg_path:
-            return web.Response(status=500, text='FFmpeg not found on this system')
-        
-        # Prepare response headers for MP4 output
+    async def _stream_remux_to_mp4(self, path: str, filename: str, request: web.Request, ffmpeg_path: str) -> web.StreamResponse:
+        """Remux original to MP4: copy video if possible, transcode audio to AAC for compatibility."""
         headers = {
             'Content-Type': 'video/mp4',
             'Content-Disposition': f"inline; filename*=UTF-8''{urllib.parse.quote(filename.rsplit('.', 1)[0] + '.mp4')}",
-            'Accept-Ranges': 'none',  # Can't seek in transcoded stream
-            'Cache-Control': 'no-cache',  # Don't cache transcoded content
+            'Cache-Control': 'no-cache',
         }
-        
         resp = web.StreamResponse(status=200, reason='OK', headers=headers)
         await resp.prepare(request)
-        
         loop = asyncio.get_running_loop()
-        
-        # Re-encode for better compatibility (stream copy can be unreliable)
+
         cmd = [
             ffmpeg_path,
             '-hide_banner', '-loglevel', 'error', '-stats',
             '-i', 'pipe:0',
-            '-c:v', 'libx264',  # Re-encode video for compatibility
-            '-preset', 'ultrafast',  # Fast encoding
-            '-crf', '28',  # Good quality/size balance
-            '-maxrate', '2M',  # Limit bitrate
-            '-bufsize', '4M',
-            '-c:a', 'aac',  # Re-encode audio
-            '-b:a', '128k',  # Audio bitrate
-            '-ac', '2',  # Stereo
-            '-movflags', '+faststart+frag_keyframe+empty_moov',  # Progressive download
+            '-c:v', 'copy',
+            '-c:a', 'aac', '-b:a', '192k', '-ac', '2',
+            '-movflags', '+faststart+frag_keyframe+empty_moov',
             '-f', 'mp4',
-            '-avoid_negative_ts', 'make_zero',  # Fix timestamp issues
             'pipe:1',
         ]
-        
+
         async def run_ffmpeg():
-            # Launch FFmpeg process
-            print(f"Starting FFmpeg with command: {' '.join(cmd)}")
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            print(f"FFmpeg process started with PID: {proc.pid}")
-            
-            # Producer: read from SFTP and feed FFmpeg
             stop_flag = {'stop': False}
-            
+
             async def feeder():
                 sftp = None
                 try:
                     sftp = self.scanner._connect()
                     with sftp.open(path, 'rb') as f:
-                        chunk_count = 0
-                        total_bytes = 0
                         while not stop_flag['stop']:
-                            chunk = f.read(256 * 1024)  # Larger chunks for transcoding
+                            chunk = f.read(256 * 1024)
                             if not chunk:
                                 break
-                            try:
-                                if proc.stdin is not None:
-                                    proc.stdin.write(chunk)
-                                    await proc.stdin.drain()  # Proper async drain
-                                    chunk_count += 1
-                                    total_bytes += len(chunk)
-                                    if chunk_count % 10 == 0:  # Log every 10 chunks
-                                        print(f"Fed {chunk_count} chunks, {total_bytes} bytes total")
-                            except Exception as e:
-                                print(f"Error writing to FFmpeg stdin: {e}")
-                                break
-                        print(f"Feeder finished: {chunk_count} chunks, {total_bytes} bytes total")
-                except Exception as e:
-                    print(f"Feeder error: {e}")
+                            if proc.stdin is not None:
+                                proc.stdin.write(chunk)
+                                await proc.stdin.drain()
                 finally:
                     try:
                         if proc.stdin:
                             proc.stdin.close()
                             await proc.stdin.wait_closed()
-                    except Exception as e:
-                        print(f"Error closing stdin: {e}")
+                    except Exception:
+                        pass
                     if sftp:
                         sftp.close()
-            
+
             feeder_task = asyncio.create_task(feeder())
-            
-            # Start stderr reader for debugging
-            async def stderr_reader():
-                try:
-                    if proc.stderr is not None:
-                        while True:
-                            line = await proc.stderr.readline()
-                            if not line:
-                                break
-                            line_str = line.decode('utf-8', errors='ignore').strip()
-                            if line_str:
-                                print(f"FFmpeg stderr: {line_str}")
-                except Exception as e:
-                    print(f"Stderr reader error: {e}")
-            
-            stderr_task = asyncio.create_task(stderr_reader())
-            
+
             try:
-                # Consumer: stream FFmpeg output to client with timeout
                 if proc.stdout is not None:
-                    first_chunk = True
-                    chunk_count = 0
-                    total_bytes = 0
-                    last_activity = time.time()
-                    
                     while True:
+                        chunk = await proc.stdout.read(128 * 1024)
+                        if not chunk:
+                            break
                         try:
-                            # Add timeout to prevent hanging
-                            chunk = await asyncio.wait_for(proc.stdout.read(128 * 1024), timeout=30.0)
-                            if not chunk:
-                                print("FFmpeg output ended")
-                                break
-                            
-                            if first_chunk:
-                                print(f"First chunk received: {len(chunk)} bytes")
-                                first_chunk = False
-                            
-                            chunk_count += 1
-                            total_bytes += len(chunk)
-                            last_activity = time.time()
-                            
-                            if chunk_count % 10 == 0:
-                                print(f"Output {chunk_count} chunks, {total_bytes} bytes total")
-                            
-                            try:
-                                await resp.write(chunk)
-                                await resp.drain()  # Ensure data is sent
-                            except (ConnectionResetError, asyncio.CancelledError, RuntimeError) as e:
-                                print(f"Connection lost during streaming: {e}")
-                                stop_flag['stop'] = True
-                                break
-                                
-                        except asyncio.TimeoutError:
-                            print("Timeout waiting for FFmpeg output")
+                            await resp.write(chunk)
+                        except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
                             stop_flag['stop'] = True
                             break
-                        except Exception as e:
-                            print(f"Error reading from FFmpeg: {e}")
-                            break
-                    
-                    print(f"Streaming completed: {chunk_count} chunks, {total_bytes} bytes total")
-                else:
-                    print("No stdout from FFmpeg")
-            except Exception as e:
-                print(f"Consumer error: {e}")
             finally:
                 stop_flag['stop'] = True
-                stderr_task.cancel()
                 try:
                     await feeder_task
-                except Exception as e:
-                    print(f"Error waiting for feeder: {e}")
-                try:
-                    await stderr_task
-                except asyncio.CancelledError:
-                    pass
-                try:
-                    if proc.stdout:
-                        proc.stdout.close()
-                except Exception:
-                    pass
-                try:
-                    if proc.stderr:
-                        proc.stderr.close()
-                except Exception:
-                    pass
-                try:
-                    if proc.stdin:
-                        proc.stdin.close()
                 except Exception:
                     pass
                 try:
                     await proc.wait()
                 except Exception:
                     pass
-        
+
         try:
-            # Add timeout for FFmpeg startup
-            await asyncio.wait_for(run_ffmpeg(), timeout=300)  # 5 minute timeout
-        except asyncio.TimeoutError:
-            print("FFmpeg transcoding timed out")
-            return web.Response(status=408, text='Transcoding timeout')
-        except Exception as e:
-            print(f"FFmpeg error: {e}")
-            return web.Response(status=500, text=f'Transcoding failed: {str(e)}')
+            await run_ffmpeg()
         finally:
             try:
                 await resp.write_eof()
             except Exception:
                 pass
-        
+        return resp
+
+    async def _stream_with_transcoding(self, path: str, filename: str, request: web.Request, ffmpeg_path: str, target_height: Optional[int] = None) -> web.StreamResponse:
+        """Transcode to MP4; if target_height provided, scale with good quality settings."""
+        if not self.cfg.enable_video_player:
+            return web.Response(status=403, text='Video player disabled')
+
+        headers = {
+            'Content-Type': 'video/mp4',
+            'Content-Disposition': f"inline; filename*=UTF-8''{urllib.parse.quote(filename.rsplit('.', 1)[0] + '.mp4')}",
+            'Cache-Control': 'no-cache',
+        }
+        resp = web.StreamResponse(status=200, reason='OK', headers=headers)
+        await resp.prepare(request)
+        loop = asyncio.get_running_loop()
+
+        vf = []
+        if target_height:
+            vf = ['-vf', f"scale=-2:{target_height}:flags=lanczos"]
+
+        cmd = [
+            ffmpeg_path,
+            '-hide_banner', '-loglevel', 'error', '-stats',
+            '-i', 'pipe:0',
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-maxrate', '6M', '-bufsize', '12M',
+            *vf,
+            '-c:a', 'aac', '-b:a', '192k', '-ac', '2',
+            '-movflags', '+faststart+frag_keyframe+empty_moov',
+            '-f', 'mp4',
+            'pipe:1',
+        ]
+
+        async def run_ffmpeg():
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stop_flag = {'stop': False}
+
+            async def feeder():
+                sftp = None
+                try:
+                    sftp = self.scanner._connect()
+                    with sftp.open(path, 'rb') as f:
+                        while not stop_flag['stop']:
+                            chunk = f.read(256 * 1024)
+                            if not chunk:
+                                break
+                            if proc.stdin is not None:
+                                proc.stdin.write(chunk)
+                                await proc.stdin.drain()
+                finally:
+                    try:
+                        if proc.stdin:
+                            proc.stdin.close()
+                            await proc.stdin.wait_closed()
+                    except Exception:
+                        pass
+                    if sftp:
+                        sftp.close()
+
+            feeder_task = asyncio.create_task(feeder())
+
+            try:
+                if proc.stdout is not None:
+                    while True:
+                        chunk = await proc.stdout.read(128 * 1024)
+                        if not chunk:
+                            break
+                        try:
+                            await resp.write(chunk)
+                        except (ConnectionResetError, asyncio.CancelledError, RuntimeError):
+                            stop_flag['stop'] = True
+                            break
+            finally:
+                stop_flag['stop'] = True
+                try:
+                    await feeder_task
+                except Exception:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+
+        try:
+            await run_ffmpeg()
+        finally:
+            try:
+                await resp.write_eof()
+            except Exception:
+                pass
         return resp
 
