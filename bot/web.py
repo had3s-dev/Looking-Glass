@@ -1359,14 +1359,34 @@ class LinkServer:
             return None
 
     def _is_codec_browser_compatible(self, stream_info: Optional[dict]) -> bool:
-        """Heuristic: consider compatible if H.264 and 4:2:0."""
+        """Conservative browser compatibility check.
+
+        Allow only H.264 8-bit 4:2:0 with common profiles. This excludes
+        HEVC/H.265, VP9/AV1, and 10-bit/4:2:2/4:4:4 H.264 which are not
+        reliably supported across browsers.
+        """
         if not stream_info:
             return False
         codec = (stream_info.get('codec_name') or '').lower()
         pix_fmt = (stream_info.get('pix_fmt') or '').lower()
-        if codec in ('h264', 'avc1') and ('420' in pix_fmt or pix_fmt == 'yuvj420p'):
-            return True
-        return False
+        profile = (stream_info.get('profile') or '').lower()
+
+        if codec not in ('h264', 'avc1'):
+            return False
+
+        # Require strictly 8-bit 4:2:0 sampling
+        if pix_fmt not in ('yuv420p', 'yuvj420p'):
+            return False
+
+        # Accept only widely-supported profiles
+        allowed_profiles = {
+            'baseline', 'constrained baseline', 'main', 'high'
+        }
+        # Some ffprobe builds may omit profile; in that case be conservative
+        if profile and profile not in allowed_profiles:
+            return False
+
+        return True
     
     async def handle_test_video(self, request: web.Request) -> web.Response:
         """Test endpoint to debug video streaming issues"""
@@ -1436,6 +1456,7 @@ class LinkServer:
             'Content-Type': 'video/mp4',
             'Content-Disposition': f"inline; filename*=UTF-8''{urllib.parse.quote(filename.rsplit('.', 1)[0] + '.mp4')}",
             'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
         }
         resp = web.StreamResponse(status=200, reason='OK', headers=headers)
         await resp.prepare(request)
@@ -1447,7 +1468,8 @@ class LinkServer:
             '-i', 'pipe:0',
             '-c:v', 'copy',
             '-c:a', 'aac', '-b:a', '192k', '-ac', '2',
-            '-movflags', '+faststart',
+            # Fragmented MP4 suitable for streaming over a pipe
+            '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
             '-f', 'mp4',
             'pipe:1',
         ]
@@ -1525,6 +1547,7 @@ class LinkServer:
             'Content-Type': 'video/mp4',
             'Content-Disposition': f"inline; filename*=UTF-8''{urllib.parse.quote(filename.rsplit('.', 1)[0] + '.mp4')}",
             'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
         }
         resp = web.StreamResponse(status=200, reason='OK', headers=headers)
         await resp.prepare(request)
@@ -1541,7 +1564,8 @@ class LinkServer:
             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-maxrate', '6M', '-bufsize', '12M',
             *vf,
             '-c:a', 'aac', '-b:a', '192k', '-ac', '2',
-            '-movflags', '+faststart',
+            # Fragmented MP4 suitable for streaming over a pipe
+            '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
             '-f', 'mp4',
             'pipe:1',
         ]
