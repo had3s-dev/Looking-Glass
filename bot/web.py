@@ -525,6 +525,21 @@ class LinkServer:
         video_extensions = ['.mp4', '.mkv', '.webm', '.mov', '.avi']
         return any(filename.lower().endswith(ext) for ext in video_extensions)
     
+    def _get_original_mime_type(self, filename: str) -> str:
+        """Return the MIME type that matches the file's original container."""
+        lower = filename.lower()
+        if lower.endswith('.mp4') or lower.endswith('.m4v'):
+            return 'video/mp4'
+        if lower.endswith('.webm'):
+            return 'video/webm'
+        if lower.endswith('.mov'):
+            return 'video/quicktime'
+        if lower.endswith('.mkv'):
+            return 'video/x-matroska'
+        if lower.endswith('.avi'):
+            return 'video/x-msvideo'
+        return 'application/octet-stream'
+
     def _get_video_mime_type(self, filename: str) -> str:
         """Prefer MP4 container for best compatibility (remux/transcode target)."""
         lower = filename.lower()
@@ -703,7 +718,8 @@ class LinkServer:
                         controls
                         preload="auto"
                         data-setup='{{}}'>
-                        <source src="{html.escape(stream_url)}" type="{self._get_video_mime_type(filename)}">
+                        <!-- Initial source; omit type so the browser relies on response headers -->
+                        <source src="{html.escape(stream_url)}">
                         {self._generate_subtitle_tracks(subtitle_files, token, base_url)}
                         <p class="vjs-no-js">
                             To view this video please enable JavaScript, and consider upgrading to a web browser that
@@ -758,7 +774,7 @@ class LinkServer:
                 player.ready(() => {{
                     console.log('Video.js player is ready');
                     console.log('Stream URL:', '{html.escape(stream_url)}');
-                    console.log('MIME type:', '{self._get_video_mime_type(filename)}');
+                    console.log('Initial type: video/mp4');
                     console.log('Subtitle files found:', {len(subtitle_files)});
                     loading.style.display = 'none';
                 }});
@@ -843,7 +859,9 @@ class LinkServer:
                   applyBtn.addEventListener('click', () => {{
                       const url = new URL('{html.escape(stream_url)}');
                       url.searchParams.set('quality', qualitySel.value);
-                      player.src({{ src: url.toString(), type: '{self._get_video_mime_type(filename)}' }});
+                      // Use original container type for direct; MP4 for remux/transcode
+                      const newType = qualitySel.value === 'direct' ? '{self._get_original_mime_type(filename)}' : 'video/mp4';
+                      player.src({{ src: url.toString(), type: newType }});
                       player.play();
                   }});
                 }}
@@ -885,11 +903,20 @@ class LinkServer:
         if not subtitle_file:
             subtitle_file = subtitle_files[0]
         
-        # Read and serve the subtitle file
+        # Read and serve the subtitle file from SFTP
         try:
-            with open(subtitle_file['path'], 'r', encoding='utf-8') as f:
-                content = f.read()
-            
+            sftp = self.scanner._connect()
+            try:
+                with sftp.open(subtitle_file['path'], 'rb') as f:
+                    raw = f.read()
+            finally:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+
+            content = raw.decode('utf-8', errors='replace')
+
             # Convert SRT to VTT if needed
             if subtitle_file['extension'] == '.srt':
                 content = self._convert_srt_to_vtt(content)
@@ -900,7 +927,7 @@ class LinkServer:
                 content_type = 'text/plain'
             else:
                 content_type = 'text/plain'
-            
+
             return web.Response(
                 text=content,
                 content_type=content_type,
@@ -978,7 +1005,7 @@ class LinkServer:
                 return {
                     'filename': filename,
                     'size': stat.st_size,
-                    'mime_type': self._get_video_mime_type(filename),
+                    'mime_type': self._get_original_mime_type(filename),
                     'needs_transcoding': self._needs_transcoding(filename)
                 }
             except Exception as e:
@@ -1021,14 +1048,27 @@ class LinkServer:
             return await self._stream_direct(path, filename, request)
 
         if quality == 'remux':
-            return await self._stream_remux_to_mp4(path, filename, request, ffmpeg_path)
+            # Probe to decide whether copy is browser-compatible; else transcode video
+            ffprobe_path = await self._find_ffprobe(ffmpeg_path)
+            if ffprobe_path:
+                try:
+                    vstream = await self._probe_video_stream(path, ffprobe_path)
+                except Exception:
+                    vstream = None
+            else:
+                vstream = None
+
+            if self._is_codec_browser_compatible(vstream):
+                return await self._stream_remux_to_mp4(path, filename, request, ffmpeg_path)
+            # Fallback: transcode video for compatibility
+            return await self._stream_with_transcoding(path, filename, request, ffmpeg_path, target_height=None)
 
         target_height = 1080 if quality == '1080p' else 720 if quality == '720p' else 480
         return await self._stream_with_transcoding(path, filename, request, ffmpeg_path, target_height)
     
     async def _stream_direct(self, path: str, filename: str, request: web.Request) -> web.StreamResponse:
         """Stream video file directly without transcoding"""
-        mime_type = self._get_video_mime_type(filename)
+        mime_type = self._get_original_mime_type(filename)
         
         # Get file size and basic info
         loop = asyncio.get_running_loop()
@@ -1165,7 +1205,19 @@ class LinkServer:
         """Find FFmpeg executable path"""
         import shutil
         import subprocess
+        import os
         
+        # Respect configured path first
+        cfg_path = getattr(self.cfg, 'ffmpeg_path', None)
+        if cfg_path:
+            try:
+                result = subprocess.run([cfg_path, '-version'], capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    print(f"Found FFmpeg from config: {cfg_path}")
+                    return cfg_path
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                pass
+
         # Try common paths
         common_paths = [
             'ffmpeg',
@@ -1173,6 +1225,9 @@ class LinkServer:
             '/usr/local/bin/ffmpeg',
             '/opt/homebrew/bin/ffmpeg',
             '/snap/bin/ffmpeg',
+            'ffmpeg.exe',
+            r'C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe',
+            r'C:\\ffmpeg\\bin\\ffmpeg.exe',
         ]
         
         for path in common_paths:
@@ -1192,6 +1247,126 @@ class LinkServer:
         
         print("FFmpeg not found in any common locations")
         return None
+
+    async def _find_ffprobe(self, ffmpeg_path: Optional[str]) -> Optional[str]:
+        """Find FFprobe executable path, trying near ffmpeg first, then PATH/common locations."""
+        import shutil
+        import subprocess
+        import os
+
+        candidates = []
+        if ffmpeg_path:
+            # Try replacing basename with ffprobe in same directory
+            base = os.path.basename(ffmpeg_path)
+            d = os.path.dirname(ffmpeg_path) or '.'
+            if base.lower().startswith('ffmpeg'):
+                alt = os.path.join(d, base.replace('ffmpeg', 'ffprobe'))
+                candidates.append(alt)
+            candidates.append(os.path.join(d, 'ffprobe'))
+            candidates.append(os.path.join(d, 'ffprobe.exe'))
+
+        candidates.extend([
+            'ffprobe',
+            '/usr/bin/ffprobe',
+            '/usr/local/bin/ffprobe',
+            '/opt/homebrew/bin/ffprobe',
+            '/snap/bin/ffprobe',
+            r'C:\\Program Files\\ffmpeg\\bin\\ffprobe.exe',
+            r'C:\\ffmpeg\\bin\\ffprobe.exe',
+        ])
+
+        for path in candidates:
+            try:
+                result = subprocess.run([path, '-version'], capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    return path
+            except Exception:
+                continue
+        # Fallback to PATH lookup
+        which = shutil.which('ffprobe')
+        return which
+
+    async def _probe_video_stream(self, path: str, ffprobe_path: str) -> Optional[dict]:
+        """Probe remote video stream via SFTP piping into ffprobe. Returns stream info dict or None."""
+        import json
+        probe_cmd = [
+            ffprobe_path,
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=codec_name,profile,pix_fmt,width,height',
+            '-of', 'json',
+            '-i', 'pipe:0',
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *probe_cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        stop_flag = {'stop': False}
+
+        async def feeder():
+            sftp = None
+            sent = 0
+            max_bytes = 8 * 1024 * 1024  # 8MB should be enough for probing
+            try:
+                sftp = self.scanner._connect()
+                with sftp.open(path, 'rb') as f:
+                    while not stop_flag['stop'] and sent < max_bytes:
+                        chunk = f.read(min(256 * 1024, max_bytes - sent))
+                        if not chunk:
+                            break
+                        sent += len(chunk)
+                        if proc.stdin is None:
+                            break
+                        try:
+                            proc.stdin.write(chunk)
+                            await proc.stdin.drain()
+                        except Exception:
+                            break
+            finally:
+                try:
+                    if proc.stdin:
+                        proc.stdin.close()
+                        await proc.stdin.wait_closed()
+                except Exception:
+                    pass
+                try:
+                    if sftp:
+                        sftp.close()
+                except Exception:
+                    pass
+
+        feeder_task = asyncio.create_task(feeder())
+        try:
+            stdout, stderr = await proc.communicate()
+        finally:
+            stop_flag['stop'] = True
+            try:
+                await feeder_task
+            except Exception:
+                pass
+
+        if not stdout:
+            return None
+        try:
+            data = json.loads(stdout.decode('utf-8', errors='ignore'))
+            streams = data.get('streams') or []
+            return streams[0] if streams else None
+        except Exception:
+            return None
+
+    def _is_codec_browser_compatible(self, stream_info: Optional[dict]) -> bool:
+        """Heuristic: consider compatible if H.264 and 4:2:0."""
+        if not stream_info:
+            return False
+        codec = (stream_info.get('codec_name') or '').lower()
+        pix_fmt = (stream_info.get('pix_fmt') or '').lower()
+        if codec in ('h264', 'avc1') and ('420' in pix_fmt or pix_fmt == 'yuvj420p'):
+            return True
+        return False
     
     async def handle_test_video(self, request: web.Request) -> web.Response:
         """Test endpoint to debug video streaming issues"""
