@@ -690,8 +690,8 @@ class LinkServer:
                     font-size: 18px;
                     z-index: 100;
                 }}
-                .controls { position: absolute; left: 20px; bottom: 20px; display: flex; gap: 12px; z-index: 1001; }
-                .controls select, .controls button { background: rgba(0,0,0,0.7); color:#fff; border:1px solid #555; padding:8px 12px; border-radius:4px; }
+                .controls {{ position: absolute; left: 20px; bottom: 20px; display: flex; gap: 12px; z-index: 1001; }}
+                .controls select, .controls button {{ background: rgba(0,0,0,0.7); color:#fff; border: 1px solid #555; padding: 8px 12px; border-radius: 4px; }}
             </style>
         </head>
         <body>
@@ -711,15 +711,15 @@ class LinkServer:
                         </p>
                     </video-js>
                     <div class="loading" id="loading">Loading video...</div>
-                    <div class="controls">
-                        <select id="quality">
-                            <option value="direct">Direct</option>
-                            <option value="remux">Original (Remux)</option>
-                            <option value="1080p">1080p</option>
-                            <option value="720p">720p</option>
-                            <option value="480p">480p</option>
-                        </select>
-                        <button id="apply">Apply</button>
+                    <div class="controls"> 
+                        <select id="quality"> 
+                            <option value="direct">Direct</option> 
+                            <option value="remux">Original (Remux)</option> 
+                            <option value="1080p">1080p</option> 
+                            <option value="720p">720p</option> 
+                            <option value="480p">480p</option> 
+                        </select> 
+                        <button id="apply">Apply</button> 
                     </div>
                 </div>
                 
@@ -839,14 +839,14 @@ class LinkServer:
                             break;
                     }}
                 }});
-                if (applyBtn) {
-                  applyBtn.addEventListener('click', () => {
+                if (applyBtn) {{
+                  applyBtn.addEventListener('click', () => {{
                       const url = new URL('{html.escape(stream_url)}');
                       url.searchParams.set('quality', qualitySel.value);
-                      player.src({ src: url.toString(), type: '{self._get_video_mime_type(filename)}' });
+                      player.src({{ src: url.toString(), type: '{self._get_video_mime_type(filename)}' }});
                       player.play();
-                  });
-                }
+                  }});
+                }}
             </script>
         </body>
         </html>
