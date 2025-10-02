@@ -417,8 +417,19 @@ def build_bot(cfg: Config) -> commands.Bot:
 
     # Owner-only: force re-sync slash commands
     async def sync_slash(interaction: discord.Interaction):
-        if cfg.owner_user_id is not None and interaction.user.id != cfg.owner_user_id:
-            await interaction.response.send_message("Not authorized.", ephemeral=True)
+        authorized = False
+        # Owner check
+        if cfg.owner_user_id is None or interaction.user.id == cfg.owner_user_id:
+            authorized = True
+        # Fallback: allow server admins (Manage Guild)
+        try:
+            member = interaction.user  # type: ignore
+            if hasattr(member, 'guild_permissions') and member.guild_permissions.manage_guild:
+                authorized = True
+        except Exception:
+            pass
+        if not authorized:
+            await interaction.response.send_message("Not authorized. Ask a server admin or the bot owner to run /sync.", ephemeral=True)
             return
         try:
             await interaction.response.defer(ephemeral=True, thinking=False)
