@@ -1447,7 +1447,7 @@ class LinkServer:
             '-i', 'pipe:0',
             '-c:v', 'copy',
             '-c:a', 'aac', '-b:a', '192k', '-ac', '2',
-            '-movflags', '+faststart+frag_keyframe+empty_moov',
+            '-movflags', '+faststart',
             '-f', 'mp4',
             'pipe:1',
         ]
@@ -1541,7 +1541,7 @@ class LinkServer:
             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-maxrate', '6M', '-bufsize', '12M',
             *vf,
             '-c:a', 'aac', '-b:a', '192k', '-ac', '2',
-            '-movflags', '+faststart+frag_keyframe+empty_moov',
+            '-movflags', '+faststart',
             '-f', 'mp4',
             'pipe:1',
         ]
