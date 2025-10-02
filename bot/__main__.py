@@ -55,15 +55,16 @@ def build_bot(cfg: Config) -> commands.Bot:
 
     _last_sync_ts: float = 0.0
 
-    async def register_slash_commands():
+    async def register_slash_commands(force: bool = False):
         nonlocal _last_sync_ts
         import time as _time
         # Cooldown 60s between sync attempts
-        if (_time.time() - _last_sync_ts) < 60:
+        if (not force) and ((_time.time() - _last_sync_ts) < 60):
             return
         try:
             browse_cmd = app_commands.Command(name="browse", description="Browse Books/Movies/TV/Music (ephemeral)", callback=browse_slash)
             help_cmd = app_commands.Command(name="help", description="How to use this bot", callback=help_slash)
+            sync_cmd = app_commands.Command(name="sync", description="(Owner) Re-sync slash commands", callback=sync_slash)
             folders_cmd = app_commands.Command(name="folders", description="(Owner) Export Movies/TV top-level folders as text files", callback=folders_slash)
             list_cmd = app_commands.Command(name="list", description="(Owner) Export full file lists for Movies/TV as text files", callback=list_slash)
             devbadge_cmd = app_commands.Command(name="devbadge", description="(Owner) Get the link to claim the Active Developer badge", callback=devbadge_slash)
@@ -90,6 +91,7 @@ def build_bot(cfg: Config) -> commands.Bot:
                     bot.tree.add_command(browse_cmd, guild=guild_obj)
                     bot.tree.add_command(help_cmd, guild=guild_obj)
                     if cfg.owner_user_id is not None:
+                        bot.tree.add_command(sync_cmd, guild=guild_obj)
                         bot.tree.add_command(folders_cmd, guild=guild_obj)
                         bot.tree.add_command(list_cmd, guild=guild_obj)
                         bot.tree.add_command(devbadge_cmd, guild=guild_obj)
@@ -101,6 +103,7 @@ def build_bot(cfg: Config) -> commands.Bot:
                 bot.tree.add_command(browse_cmd)
                 bot.tree.add_command(help_cmd)
                 if cfg.owner_user_id is not None:
+                    bot.tree.add_command(sync_cmd)
                     bot.tree.add_command(folders_cmd)
                     bot.tree.add_command(list_cmd)
                     bot.tree.add_command(devbadge_cmd)
@@ -411,6 +414,18 @@ def build_bot(cfg: Config) -> commands.Bot:
         )
         embed.add_field(name="Commands", value="`/browse` — browse and get links\n`/help` — show this help", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=False)
+
+    # Owner-only: force re-sync slash commands
+    async def sync_slash(interaction: discord.Interaction):
+        if cfg.owner_user_id is not None and interaction.user.id != cfg.owner_user_id:
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=False)
+        except Exception:
+            pass
+        await register_slash_commands(force=True)
+        await interaction.followup.send("Slash commands re-synced.", ephemeral=True)
 
     # Owner-only: list top-level folders under Movies and TV and return as text files
     async def folders_slash(interaction: discord.Interaction):
