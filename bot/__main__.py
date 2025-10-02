@@ -12,6 +12,7 @@ from .scanner import SeedboxScanner
 from .cache import LibraryCache
 from .web import LinkServer
 from .unified_browse import UnifiedBrowserView
+from .multi_tenant import TenantManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("discord-seedbox-bot")
@@ -27,19 +28,13 @@ def build_bot(cfg: Config) -> commands.Bot:
         intents.message_content = True
     bot = commands.Bot(command_prefix=cfg.command_prefix, intents=intents, help_command=None)
 
+    tenant = TenantManager(cfg)
+    # Default (global/ID 0) resources
     cache = LibraryCache(max_age_seconds=cfg.cache_ttl_seconds)
     movies_cache: LibraryCache = LibraryCache(max_age_seconds=cfg.cache_ttl_seconds)
     tv_cache: LibraryCache = LibraryCache(max_age_seconds=cfg.cache_ttl_seconds)
     music_cache: LibraryCache = LibraryCache(max_age_seconds=cfg.cache_ttl_seconds)
-    scanner = SeedboxScanner(
-        host=cfg.sftp_host,
-        port=cfg.sftp_port,
-        username=cfg.sftp_username,
-        password=cfg.sftp_password,
-        pkey_path=cfg.ssh_key_path,
-        root_path=cfg.library_root_path,
-        file_extensions=cfg.file_extensions,
-    )
+    scanner = tenant.get_scanner(None)
 
     # Restrict commands to channels if configured
     allowed_channel_id = cfg.allowed_channel_id
@@ -68,6 +63,7 @@ def build_bot(cfg: Config) -> commands.Bot:
             return
         try:
             browse_cmd = app_commands.Command(name="browse", description="Browse Books/Movies/TV/Music (ephemeral)", callback=browse_slash)
+            help_cmd = app_commands.Command(name="help", description="How to use this bot", callback=help_slash)
             folders_cmd = app_commands.Command(name="folders", description="(Owner) Export Movies/TV top-level folders as text files", callback=folders_slash)
             list_cmd = app_commands.Command(name="list", description="(Owner) Export full file lists for Movies/TV as text files", callback=list_slash)
             devbadge_cmd = app_commands.Command(name="devbadge", description="(Owner) Get the link to claim the Active Developer badge", callback=devbadge_slash)
@@ -92,6 +88,7 @@ def build_bot(cfg: Config) -> commands.Bot:
                     except Exception:
                         logger.exception(f"Failed to clear commands for guild {gid}")
                     bot.tree.add_command(browse_cmd, guild=guild_obj)
+                    bot.tree.add_command(help_cmd, guild=guild_obj)
                     if cfg.owner_user_id is not None:
                         bot.tree.add_command(folders_cmd, guild=guild_obj)
                         bot.tree.add_command(list_cmd, guild=guild_obj)
@@ -102,6 +99,7 @@ def build_bot(cfg: Config) -> commands.Bot:
                 # Global-only mode: clear and re-add globally
                 bot.tree.clear_commands(guild=None)
                 bot.tree.add_command(browse_cmd)
+                bot.tree.add_command(help_cmd)
                 if cfg.owner_user_id is not None:
                     bot.tree.add_command(folders_cmd)
                     bot.tree.add_command(list_cmd)
@@ -135,7 +133,7 @@ def build_bot(cfg: Config) -> commands.Bot:
         nonlocal link_server, base_link_url
         try:
             if cfg.enable_http_links and link_server is None:
-                link_server = LinkServer(cfg, scanner)
+                link_server = LinkServer(cfg, scanner, tenant=tenant)
                 await link_server.start()
                 # Build base URL
                 if cfg.public_base_url:
@@ -171,60 +169,105 @@ def build_bot(cfg: Config) -> commands.Bot:
         except Exception:
             pass
 
-    async def ensure_cache_up_to_date(force: bool = False) -> Dict[str, List[str]]:
-        data = cache.get()
+    def _guild_id_from_ctx(ctx) -> Optional[int]:
+        try:
+            return int(ctx.guild.id) if ctx.guild else None
+        except Exception:
+            return None
+
+    async def ensure_cache_up_to_date(force: bool = False, guild_id: Optional[int] = None) -> Dict[str, List[str]]:
+        if guild_id is None:
+            c = cache
+            sc = scanner
+        else:
+            c, _, _, _ = tenant.get_caches(guild_id)
+            sc = tenant.get_scanner(guild_id)
+        data = c.get()
         if force or data is None:
             loop = asyncio.get_running_loop()
-            data = await loop.run_in_executor(None, scanner.scan_library)
-            cache.set(data)
+            data = await loop.run_in_executor(None, sc.scan_library)
+            c.set(data)
         return data
 
-    async def ensure_movies_up_to_date(force: bool = False) -> List[str]:
-        if not cfg.movies_root_path:
+    async def ensure_movies_up_to_date(force: bool = False, guild_id: Optional[int] = None) -> List[str]:
+        if not cfg.movies_root_path and guild_id is None:
             return []
-        data = movies_cache.get()  # type: ignore
+        if guild_id is None:
+            c = movies_cache
+            sc = scanner
+            movies_root = cfg.movies_root_path or ""
+            exts = cfg.movie_extensions
+        else:
+            _, c, _, _ = tenant.get_caches(guild_id)
+            sc = tenant.get_scanner(guild_id)
+            params = tenant.get_effective_params(guild_id)
+            movies_root = params.get("movies_root_path") or ""
+            exts = cfg.movie_extensions
+        data = c.get()  # type: ignore
         if force or data is None:
             loop = asyncio.get_running_loop()
             def _scan_movies():
                 try:
-                    return scanner.scan_movies(cfg.movies_root_path or "", cfg.movie_extensions)
+                    return sc.scan_movies(movies_root, exts)
                 except Exception:
                     logger.exception("Movie scan failed")
                     return []
             data = await loop.run_in_executor(None, _scan_movies)
-            movies_cache.set(data)  # type: ignore
+            c.set(data)  # type: ignore
         return data  # type: ignore
 
-    async def ensure_tv_up_to_date(force: bool = False) -> Dict[str, List[str]]:
-        if not cfg.tv_root_path:
+    async def ensure_tv_up_to_date(force: bool = False, guild_id: Optional[int] = None) -> Dict[str, List[str]]:
+        if not cfg.tv_root_path and guild_id is None:
             return {}
-        data = tv_cache.get()
+        if guild_id is None:
+            c = tv_cache
+            sc = scanner
+            tv_root = cfg.tv_root_path or ""
+            exts = cfg.tv_extensions
+        else:
+            _, _, c, _ = tenant.get_caches(guild_id)
+            sc = tenant.get_scanner(guild_id)
+            params = tenant.get_effective_params(guild_id)
+            tv_root = params.get("tv_root_path") or ""
+            exts = cfg.tv_extensions
+        data = c.get()
         if force or data is None:
             loop = asyncio.get_running_loop()
             def _scan_tv():
                 try:
-                    return scanner.scan_tv(cfg.tv_root_path or "", cfg.tv_extensions)
+                    return sc.scan_tv(tv_root, exts)
                 except Exception:
                     logger.exception("TV scan failed")
                     return {}
             data = await loop.run_in_executor(None, _scan_tv)
-            tv_cache.set(data)
+            c.set(data)
         return data
 
-    async def ensure_music_up_to_date(force: bool = False) -> Dict[str, List[str]]:
-        if not cfg.music_root_path:
+    async def ensure_music_up_to_date(force: bool = False, guild_id: Optional[int] = None) -> Dict[str, List[str]]:
+        if not cfg.music_root_path and guild_id is None:
             return {}
-        data = music_cache.get()
+        if guild_id is None:
+            c = music_cache
+            sc = scanner
+            music_root = cfg.music_root_path or ""
+            exts = cfg.music_extensions
+        else:
+            _, _, _, c = tenant.get_caches(guild_id)
+            sc = tenant.get_scanner(guild_id)
+            params = tenant.get_effective_params(guild_id)
+            music_root = params.get("music_root_path") or ""
+            exts = cfg.music_extensions
+        data = c.get()
         if force or data is None:
             loop = asyncio.get_running_loop()
             def _scan_music():
                 try:
-                    return scanner.scan_music(cfg.music_root_path or "", cfg.music_extensions)
+                    return sc.scan_music(music_root, exts)
                 except Exception:
                     logger.exception("Music scan failed")
                     return {}
             data = await loop.run_in_executor(None, _scan_music)
-            music_cache.set(data)
+            c.set(data)
         return data
 
     @tasks.loop(minutes=30)
@@ -265,10 +308,11 @@ def build_bot(cfg: Config) -> commands.Bot:
             await ctx.send("HTTP link server is not ready yet. Please try again shortly.")
             return
         # Ensure caches are loaded (non-forced)
-        books_data = await ensure_cache_up_to_date()
-        movies_list = await ensure_movies_up_to_date()
-        tv_data = await ensure_tv_up_to_date()
-        music_data = await ensure_music_up_to_date()
+        gid = _guild_id_from_ctx(ctx)
+        books_data = await ensure_cache_up_to_date(guild_id=gid)
+        movies_list = await ensure_movies_up_to_date(guild_id=gid)
+        tv_data = await ensure_tv_up_to_date(guild_id=gid)
+        music_data = await ensure_music_up_to_date(guild_id=gid)
 
         def get_books_data_local():
             return books_data
@@ -314,10 +358,11 @@ def build_bot(cfg: Config) -> commands.Bot:
             pass
 
         # Preload caches
-        books_data = await ensure_cache_up_to_date()
-        movies_list = await ensure_movies_up_to_date()
-        tv_data = await ensure_tv_up_to_date()
-        music_data = await ensure_music_up_to_date()
+        gid = interaction.guild_id
+        books_data = await ensure_cache_up_to_date(guild_id=gid)
+        movies_list = await ensure_movies_up_to_date(guild_id=gid)
+        tv_data = await ensure_tv_up_to_date(guild_id=gid)
+        music_data = await ensure_music_up_to_date(guild_id=gid)
 
         def get_books_data_local():
             return books_data
@@ -346,6 +391,26 @@ def build_bot(cfg: Config) -> commands.Bot:
             rescan_callback=rescan_callback,
         )
         await interaction.followup.send(embed=discord.Embed(title="Browse", description="Choose a category."), view=view, ephemeral=True)
+
+    # Slash help command: non-ephemeral so it can be pinned
+    async def help_slash(interaction: discord.Interaction):
+        embed = discord.Embed(
+            title="Looking-Glass Help",
+            description=(
+                "Use `/browse` to open the library browser. Your interactions are ephemeral and only visible to you.\n\n"
+                "Tips:\n"
+                "- Select a category, then pick an item to get a links page.\n"
+                "- You'll get a DM with direct links when possible, plus a button to open the signed links page.\n"
+                "- Links expire automatically; ask an admin if you need longer TTL.\n\n"
+                "Admins:\n"
+                "- Set `ENABLE_HTTP_LINKS=true` and `PUBLIC_BASE_URL` for public access.\n"
+                "- Set a strong `LINK_SECRET`.\n"
+                "- Optionally enable `ENABLE_VIDEO_PLAYER` for browser playback."
+            ),
+            color=discord.Color.blurple()
+        )
+        embed.add_field(name="Commands", value="`/browse` — browse and get links\n`/help` — show this help", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=False)
 
     # Owner-only: list top-level folders under Movies and TV and return as text files
     async def folders_slash(interaction: discord.Interaction):

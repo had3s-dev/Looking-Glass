@@ -14,19 +14,23 @@ from aiohttp import web
 
 from .config import Config
 from .scanner import SeedboxScanner
+from .multi_tenant import TenantManager
 
 
 class LinkServer:
-    def __init__(self, cfg: Config, scanner: SeedboxScanner) -> None:
+    def __init__(self, cfg: Config, scanner: SeedboxScanner, tenant: Optional[TenantManager] = None) -> None:
         self.cfg = cfg
         self.scanner = scanner
+        self.tenant = tenant
         self.app = web.Application()
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
-        self.app.add_routes([
+        routes = [
             web.get('/links', self.handle_links),
             web.get('/d', self.handle_download),
             web.get('/', self.handle_root),
+            web.get('/admin', self.handle_admin_page),
+            web.post('/admin/save', self.handle_admin_save),
             web.get('/upload', self.handle_upload_form),
             web.post('/upload', self.handle_upload),
             web.get('/video', self.handle_video_player),
@@ -34,7 +38,15 @@ class LinkServer:
             web.get('/info', self.handle_video_info),
             web.get('/subtitle', self.handle_subtitle),
             web.get('/test-video', self.handle_test_video),
-        ])
+        ]
+        # Guild admin endpoints only if tenant manager is present
+        if self.tenant is not None:
+            routes.extend([
+                web.get('/admin/generate-token', self.handle_admin_generate_token),
+                web.get('/admin/g', self.handle_admin_guild_page),
+                web.post('/admin/g/save', self.handle_admin_guild_save),
+            ])
+        self.app.add_routes(routes)
 
     async def start(self):
         if self.runner is not None:
@@ -58,15 +70,21 @@ class LinkServer:
         host = self.cfg.http_host if self.cfg.http_host != '0.0.0.0' else '127.0.0.1'
         return f"http://{host}:{self.cfg.http_port}"
 
+    def _is_admin(self, request: web.Request) -> bool:
+        token = request.headers.get('x-admin-token') or request.query.get('token') or (request.cookies.get('admin_token') if request.cookies else None)
+        expected = getattr(self.cfg, 'admin_token', None)
+        return bool(expected and token and hmac.compare_digest(expected, token))
+
     # ---- Signing helpers ----
-    def sign_path(self, path: str, exp_ts: int) -> str:
+    def sign_path(self, path: str, exp_ts: int, guild_id: Optional[int] = None) -> str:
         secret = (self.cfg.link_secret or 'dev-secret').encode('utf-8')
-        token = base64.urlsafe_b64encode(path.encode('utf-8')).decode('utf-8')
+        payload_plain = f"{int(guild_id or 0)}|{path}"
+        token = base64.urlsafe_b64encode(payload_plain.encode('utf-8')).decode('utf-8')
         payload = f"{token}.{exp_ts}".encode('utf-8')
         sig = hmac.new(secret, payload, hashlib.sha256).hexdigest()
         return f"{token}.{exp_ts}.{sig}"
 
-    def verify_token(self, token: str) -> Optional[str]:
+    def verify_token(self, token: str) -> Optional[Tuple[Optional[int], str]]:
         try:
             token_b64, exp_s, sig = token.split('.')
             exp_ts = int(exp_s)
@@ -81,14 +99,242 @@ class LinkServer:
         if not hmac.compare_digest(expected, sig):
             return None
         try:
-            path = base64.urlsafe_b64decode(token_b64.encode('utf-8')).decode('utf-8')
-            return path
+            decoded = base64.urlsafe_b64decode(token_b64.encode('utf-8')).decode('utf-8')
+            if '|' in decoded:
+                gid_str, path = decoded.split('|', 1)
+                try:
+                    gid_val = int(gid_str)
+                except Exception:
+                    gid_val = 0
+                return (gid_val if gid_val != 0 else None, path)
+            else:
+                # Backward compatibility: old tokens had only path
+                return (None, decoded)
         except Exception:
             return None
 
 
 
     # ---- Routes ----
+    async def handle_admin_page(self, request: web.Request) -> web.Response:
+        if not self._is_admin(request):
+            return web.Response(status=401, text='Unauthorized')
+        # Very simple JSON form
+        html_page = """
+        <!doctype html>
+        <html>
+        <head>
+            <meta charset="utf-8" />
+            <title>Looking-Glass Admin</title>
+            <style> body { font-family: system-ui, sans-serif; max-width: 920px; margin: 32px auto; }
+            input, select, textarea { width: 100%; padding: 8px; margin: 6px 0 12px; }
+            label { font-weight: 600; }
+            .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+            .row > div { }
+            button { padding: 10px 16px; }
+            pre { background:#111; color:#eee; padding:12px; overflow:auto; }
+            </style>
+        </head>
+        <body>
+            <h1>Looking-Glass Admin</h1>
+            <p>Edit runtime config below and click Save. A bot restart is not required for most settings.</p>
+            <div id="status"></div>
+            <textarea id="config" rows="28" spellcheck="false"></textarea>
+            <div>
+                <button id="save">Save</button>
+            </div>
+            <h3>Tips</h3>
+            <ul>
+              <li>Set <code>public_base_url</code> and <code>link_secret</code> for public installs.</li>
+              <li>Set <code>enable_http_links</code> and (optional) <code>enable_video_player</code>.</li>
+              <li>SFTP: <code>sftp_host</code>, <code>sftp_port</code>, <code>sftp_username</code>, password or <code>ssh_key_path</code>.</li>
+            </ul>
+            <script>
+              const token = new URLSearchParams(location.search).get('token');
+              const cfgEl = document.getElementById('config');
+              const statusEl = document.getElementById('status');
+              const initial = {
+                sftp_host: "{sftp_host}",
+                sftp_port: {sftp_port},
+                sftp_username: "{sftp_username}",
+                library_root_path: "{lib_root}",
+                movies_root_path: "{movies_root}",
+                tv_root_path: "{tv_root}",
+                music_root_path: "{music_root}",
+                enable_http_links: {enable_http_links},
+                public_base_url: "{public_base_url}",
+                link_secret: "",
+                link_ttl_seconds: {link_ttl},
+                enable_video_player: {enable_video_player},
+                page_size: {page_size},
+                cache_ttl_seconds: {cache_ttl},
+                log_level: "{log_level}"
+              };
+              cfgEl.value = JSON.stringify(initial, null, 2);
+              document.getElementById('save').onclick = async () => {
+                try {
+                  const res = await fetch('/admin/save' + (token ? ('?token=' + encodeURIComponent(token)) : ''), {
+                    method: 'POST', headers: { 'content-type': 'application/json' }, body: cfgEl.value
+                  });
+                  const text = await res.text();
+                  statusEl.textContent = res.ok ? 'Saved.' : ('Error: ' + text);
+                } catch (e) {
+                  statusEl.textContent = 'Error: ' + e;
+                }
+              };
+            </script>
+        </body>
+        </html>
+        """.format(
+            sftp_host=html.escape(self.cfg.sftp_host or ""),
+            sftp_port=self.cfg.sftp_port,
+            sftp_username=html.escape(self.cfg.sftp_username or ""),
+            lib_root=html.escape(self.scanner.root_path or ""),
+            movies_root=html.escape(self.cfg.movies_root_path or ""),
+            tv_root=html.escape(self.cfg.tv_root_path or ""),
+            music_root=html.escape(self.cfg.music_root_path or ""),
+            enable_http_links=str(bool(self.cfg.enable_http_links)).lower(),
+            public_base_url=html.escape(self.cfg.public_base_url or ""),
+            link_ttl=self.cfg.link_ttl_seconds,
+            enable_video_player=str(bool(self.cfg.enable_video_player)).lower(),
+            page_size=self.cfg.page_size,
+            cache_ttl=self.cfg.cache_ttl_seconds,
+            log_level=html.escape(self.cfg.log_level or "INFO"),
+        )
+        return web.Response(text=html_page, content_type='text/html')
+
+    async def handle_admin_save(self, request: web.Request) -> web.Response:
+        if not self._is_admin(request):
+            return web.Response(status=401, text='Unauthorized')
+        try:
+            body = await request.text()
+            import json, os
+            data = json.loads(body)
+            # Persist to runtime_config.json or configured path
+            path = getattr(self.cfg, 'runtime_config_path', 'runtime_config.json') or 'runtime_config.json'
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+            # Apply to live config for most keys immediately
+            # Minimal live updates: paths, flags, ttl, page size
+            self.cfg.enable_http_links = bool(data.get('enable_http_links', self.cfg.enable_http_links))
+            self.cfg.public_base_url = data.get('public_base_url', self.cfg.public_base_url)
+            if data.get('link_secret'):
+                self.cfg.link_secret = str(data.get('link_secret'))
+            self.cfg.link_ttl_seconds = int(data.get('link_ttl_seconds', self.cfg.link_ttl_seconds))
+            self.cfg.enable_video_player = bool(data.get('enable_video_player', self.cfg.enable_video_player))
+            self.cfg.page_size = int(data.get('page_size', self.cfg.page_size))
+            self.cfg.cache_ttl_seconds = int(data.get('cache_ttl_seconds', self.cfg.cache_ttl_seconds))
+            # Update scanner roots live
+            new_books_root = data.get('library_root_path')
+            if isinstance(new_books_root, str) and new_books_root:
+                self.scanner.root_path = new_books_root
+            for attr, key in (("movies_root_path", "movies_root_path"),("tv_root_path","tv_root_path"),("music_root_path","music_root_path")):
+                val = data.get(key)
+                if isinstance(val, str) or val is None:
+                    setattr(self.cfg, attr, val)
+            return web.Response(text='OK')
+        except Exception as e:
+            return web.Response(status=400, text=str(e))
+
+    # --- Multi-tenant admin helpers ---
+    async def handle_admin_generate_token(self, request: web.Request) -> web.Response:
+        if not self._is_admin(request) or self.tenant is None:
+            return web.Response(status=401, text='Unauthorized')
+        try:
+            gid = int(request.query.get('guild_id', '0'))
+            tok = self.tenant.create_admin_token(gid)
+            return web.json_response({"token": tok, "expires_in": 900, "guild_id": gid})
+        except Exception as e:
+            return web.Response(status=400, text=str(e))
+
+    async def handle_admin_guild_page(self, request: web.Request) -> web.Response:
+        if self.tenant is None:
+            return web.Response(status=404, text='Not available')
+        tok = request.query.get('token')
+        gid = self.tenant.validate_admin_token(tok)
+        if gid is None:
+            return web.Response(status=401, text='Unauthorized')
+        params = self.tenant.get_effective_params(gid)
+        html_page = """
+        <!doctype html>
+        <html>
+        <head><meta charset='utf-8'><title>Guild Admin</title>
+        <style> body{font-family:system-ui,sans-serif;max-width:920px;margin:32px auto;} input,textarea{width:100%;padding:8px;margin:6px 0 12px} </style>
+        </head>
+        <body>
+          <h1>Guild Settings</h1>
+          <p>Configure this server's seedbox settings. Leave fields blank to inherit the default.</p>
+          <div id='status'></div>
+          <label>SFTP Host</label>
+          <input id='sftp_host' value="{sftp_host}">
+          <label>SFTP Port</label>
+          <input id='sftp_port' type='number' value="{sftp_port}">
+          <label>Username</label>
+          <input id='sftp_username' value="{sftp_username}">
+          <label>Password</label>
+          <input id='sftp_password' type='password' value="">
+          <label>SSH Key Path (on host)</label>
+          <input id='ssh_key_path' value="{ssh_key_path}">
+          <label>Books Root Path</label>
+          <input id='library_root_path' value="{lib_root}">
+          <label>Movies Root Path</label>
+          <input id='movies_root_path' value="{movies_root}">
+          <label>TV Root Path</label>
+          <input id='tv_root_path' value="{tv_root}">
+          <label>Music Root Path</label>
+          <input id='music_root_path' value="{music_root}">
+          <button id='save'>Save</button>
+          <script>
+            const token = new URLSearchParams(location.search).get('token');
+            const gid = {gid};
+            function val(id){return document.getElementById(id).value}
+            document.getElementById('save').onclick = async () => {
+              const body = {
+                sftp_host: val('sftp_host')||null,
+                sftp_port: Number(val('sftp_port'))||null,
+                sftp_username: val('sftp_username')||null,
+                sftp_password: val('sftp_password')||null,
+                ssh_key_path: val('ssh_key_path')||null,
+                library_root_path: val('library_root_path')||null,
+                movies_root_path: val('movies_root_path')||null,
+                tv_root_path: val('tv_root_path')||null,
+                music_root_path: val('music_root_path')||null,
+              };
+              try{
+                const res = await fetch('/admin/g/save?token='+encodeURIComponent(token)+'&guild_id='+gid,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+                document.getElementById('status').textContent = res.ok ? 'Saved' : ('Error: '+await res.text());
+              }catch(e){ document.getElementById('status').textContent = 'Error: '+e; }
+            };
+          </script>
+        </body>
+        </html>
+        """.format(
+            sftp_host=html.escape(params.get('sftp_host') or ''),
+            sftp_port=int(params.get('sftp_port') or 22),
+            sftp_username=html.escape(params.get('sftp_username') or ''),
+            ssh_key_path=html.escape(params.get('ssh_key_path') or ''),
+            lib_root=html.escape(params.get('library_root_path') or ''),
+            movies_root=html.escape(params.get('movies_root_path') or ''),
+            tv_root=html.escape(params.get('tv_root_path') or ''),
+            music_root=html.escape(params.get('music_root_path') or ''),
+            gid=int(gid),
+        )
+        return web.Response(text=html_page, content_type='text/html')
+
+    async def handle_admin_guild_save(self, request: web.Request) -> web.Response:
+        if self.tenant is None:
+            return web.Response(status=404, text='Not available')
+        tok = request.query.get('token')
+        gid = self.tenant.validate_admin_token(tok)
+        if gid is None:
+            return web.Response(status=401, text='Unauthorized')
+        try:
+            import json
+            data = await request.json()
+            self.tenant.update_guild_config(int(gid), data)
+            return web.Response(text='OK')
+        except Exception as e:
+            return web.Response(status=400, text=str(e))
     async def handle_upload_form(self, request: web.Request) -> web.Response:
         content = """
             <!DOCTYPE html>
@@ -205,6 +451,12 @@ class LinkServer:
     async def handle_links(self, request: web.Request) -> web.Response:
         kind = request.query.get('kind', '')
         name = request.query.get('name', '')
+        guild_id = request.query.get('guild_id')
+        gid: Optional[int] = None
+        try:
+            gid = int(guild_id) if guild_id is not None else None
+        except Exception:
+            gid = None
         if kind not in ('books', 'movies', 'tv', 'music'):
             return web.Response(status=400, text='Invalid kind')
         if not name:
@@ -222,7 +474,7 @@ class LinkServer:
         exp = int(time.time()) + self.cfg.link_ttl_seconds
         items = []
         for path, size in files:
-            token = self.sign_path(path, exp)
+            token = self.sign_path(path, exp, gid)
             url = f"{base}/d?token={urllib.parse.quote(token)}"
             items.append((path.rsplit('/', 1)[-1], url, size))
 
@@ -231,7 +483,7 @@ class LinkServer:
         video_items: List[Tuple[str, str, int]] = []
         if kind in ('movies', 'tv') and self.cfg.enable_video_player:
             try:
-                video_items = self.build_video_links(kind, name)
+                video_items = self.build_video_links(kind, name, gid)
             except Exception:
                 video_items = []
 
@@ -261,7 +513,7 @@ class LinkServer:
         
         return web.Response(text="\n".join(body), content_type='text/html')
 
-    def build_links(self, kind: str, name: str) -> List[Tuple[str, str, int]]:
+    def build_links(self, kind: str, name: str, guild_id: Optional[int] = None) -> List[Tuple[str, str, int]]:
         """
         Build signed direct-download links for a given kind/name selection.
         Returns a list of tuples: (filename, url, size_bytes).
@@ -276,12 +528,12 @@ class LinkServer:
         exp = int(time.time()) + self.cfg.link_ttl_seconds
         items: List[Tuple[str, str, int]] = []
         for path, size in files:
-            token = self.sign_path(path, exp)
+            token = self.sign_path(path, exp, guild_id)
             url = f"{base}/d?token={urllib.parse.quote(token)}"
             items.append((path.rsplit('/', 1)[-1], url, size))
         return items
 
-    def build_video_links(self, kind: str, name: str) -> List[Tuple[str, str, int]]:
+    def build_video_links(self, kind: str, name: str, guild_id: Optional[int] = None) -> List[Tuple[str, str, int]]:
         """
         Build video player links for Movies/TV selection.
         Returns a list of tuples: (filename, url, size_bytes).
@@ -300,7 +552,7 @@ class LinkServer:
             filename = path.rsplit('/', 1)[-1]
             # Only include video files
             if self._is_video_file(filename):
-                token = self.sign_path(path, exp)
+                token = self.sign_path(path, exp, guild_id)
                 url = f"{base}/video?token={urllib.parse.quote(token)}"
                 out.append((filename, url, size))
         
@@ -441,9 +693,10 @@ class LinkServer:
         token = request.query.get('token')
         if not token:
             return web.Response(status=400, text='Missing token')
-        path = self.verify_token(token)
-        if not path:
+        verified = self.verify_token(token)
+        if not verified:
             return web.Response(status=403, text='Invalid or expired token')
+        gid, path = verified
 
         # Stream file via SFTP in background thread
         resp = web.StreamResponse(status=200, reason='OK', headers={"Content-Type": "application/octet-stream"})
@@ -599,9 +852,10 @@ class LinkServer:
         if not token:
             return web.Response(status=400, text='Missing token')
         
-        path = self.verify_token(token)
-        if not path:
+        verified = self.verify_token(token)
+        if not verified:
             return web.Response(status=403, text='Invalid or expired token')
+        gid, path = verified
         
         filename = path.rsplit('/', 1)[-1]
         if not self._is_video_file(filename):
@@ -833,9 +1087,10 @@ class LinkServer:
         if not token:
             return web.Response(status=400, text='Missing token')
         
-        path = self.verify_token(token)
-        if not path:
+        verified = self.verify_token(token)
+        if not verified:
             return web.Response(status=403, text='Invalid or expired token')
+        gid, path = verified
         
         # Find subtitle files for this video
         subtitle_files = self._find_subtitle_files(path)

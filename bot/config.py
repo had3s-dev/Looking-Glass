@@ -66,6 +66,8 @@ class Config:
     # App behavior for public deployment
     enable_prefix_commands: bool
     log_level: str
+    admin_token: Optional[str]
+    runtime_config_path: str
 
 
 
@@ -113,6 +115,95 @@ def getenv_int_list(name: str) -> List[int]:
     return out
 
 
+def _apply_runtime_overrides(cfg: Config) -> Config:
+    import json
+    path = cfg.runtime_config_path or "runtime_config.json"
+    try:
+        if not os.path.exists(path):
+            return cfg
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return cfg
+
+    # Simple typed setters
+    def set_str(name: str):
+        v = data.get(name)
+        if isinstance(v, str):
+            setattr(cfg, name, v)
+
+    def set_opt_str(name: str):
+        v = data.get(name)
+        if v is None or isinstance(v, str):
+            setattr(cfg, name, v)
+
+    def set_bool(name: str):
+        v = data.get(name)
+        if isinstance(v, bool):
+            setattr(cfg, name, v)
+
+    def set_int(name: str):
+        v = data.get(name)
+        if isinstance(v, int):
+            setattr(cfg, name, v)
+
+    def set_list_str(name: str):
+        v = data.get(name)
+        if isinstance(v, list):
+            arr = [str(x) for x in v]
+            setattr(cfg, name, arr)
+        elif isinstance(v, str):
+            parts = [p.strip() for p in v.split(",") if p.strip()]
+            setattr(cfg, name, parts)
+
+    def set_list_int(name: str):
+        v = data.get(name)
+        if isinstance(v, list):
+            out = []
+            for x in v:
+                try:
+                    out.append(int(x))
+                except Exception:
+                    continue
+            setattr(cfg, name, out)
+        elif isinstance(v, str):
+            out = []
+            for part in v.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    out.append(int(part))
+                except Exception:
+                    continue
+            setattr(cfg, name, out)
+
+    # Apply known keys
+    for key in [
+        "sftp_host","sftp_username","sftp_password","ssh_key_path","library_root_path",
+        "movies_root_path","tv_root_path","music_root_path","public_base_url","ffmpeg_path",
+        "http_host","link_secret","command_prefix","log_level"
+    ]:
+        set_str(key)
+    for key in ["discord_token","admin_token"]:
+        set_opt_str(key)
+    for key in [
+        "enable_downloads","enable_http_links","enable_video_player","enable_prefix_commands"
+    ]:
+        set_bool(key)
+    for key in [
+        "sftp_port","page_size","cache_ttl_seconds","http_port","link_ttl_seconds",
+        "video_cache_seconds","max_concurrent_streams","owner_user_id","allowed_channel_id","guild_id"
+    ]:
+        set_int(key)
+    for key in ["file_extensions","movie_extensions","tv_extensions","music_extensions"]:
+        set_list_str(key)
+    for key in ["allowed_channel_ids","guild_ids"]:
+        set_list_int(key)
+
+    return cfg
+
+
 def load_config() -> Config:
     # Load .env if present
     load_dotenv()
@@ -130,7 +221,7 @@ def load_config() -> Config:
         os.chmod(tmp.name, stat.S_IRUSR | stat.S_IWUSR)
         ssh_key_path = tmp.name
 
-    return Config(
+    cfg = Config(
         discord_token=os.getenv("DISCORD_TOKEN", ""),
         command_prefix=os.getenv("COMMAND_PREFIX", "!"),
         sftp_host=os.getenv("SFTP_HOST", ""),
@@ -171,4 +262,7 @@ def load_config() -> Config:
         max_concurrent_streams=getenv_int("MAX_CONCURRENT_STREAMS", 3),
         enable_prefix_commands=os.getenv("ENABLE_PREFIX_COMMANDS", "false").lower() in ("1", "true", "yes"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        admin_token=os.getenv("ADMIN_TOKEN"),
+        runtime_config_path=os.getenv("RUNTIME_CONFIG_PATH", "runtime_config.json"),
     )
+    return _apply_runtime_overrides(cfg)
