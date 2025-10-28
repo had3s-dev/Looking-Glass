@@ -110,11 +110,17 @@ class SeedboxScanner:
           /root/Show Name/episode.ext
         Returns: { show_name: [episode labels] }
         """
+        import logging
+        logger = logging.getLogger("Looking-Glass")
         sftp = self._connect()
         result: Dict[str, List[str]] = {}
         try:
-            for show_entry in sftp.listdir_attr(root_path):
+            show_entries = sftp.listdir_attr(root_path)
+            logger.info(f"TV scan: found {len(show_entries)} shows in root directory")
+            for idx, show_entry in enumerate(show_entries):
                 show_name = show_entry.filename
+                if idx % 10 == 0:
+                    logger.info(f"TV scan: processing show {idx+1}/{len(show_entries)}: {show_name}")
                 show_path = posixpath.join(root_path, show_name)
                 episodes: List[str] = []
                 if self._is_dir(sftp, show_path):

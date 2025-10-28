@@ -72,7 +72,7 @@ def build_bot(cfg: Config) -> commands.Bot:
             help_cmd = app_commands.Command(name="help", description="How to use this bot", callback=help_slash)
             sync_cmd = app_commands.Command(name="sync", description="(Owner) Re-sync slash commands", callback=sync_slash)
             folders_cmd = app_commands.Command(name="folders", description="(Owner) Export Movies/TV top-level folders as text files", callback=folders_slash)
-            list_cmd = app_commands.Command(name="list", description="(Owner) Export full file lists for Movies/TV as text files", callback=list_slash)
+            list_cmd = app_commands.Command(name="list", description="Export full file lists for Movies/TV as text files", callback=list_slash)
             devbadge_cmd = app_commands.Command(name="devbadge", description="(Owner) Get the link to claim the Active Developer badge", callback=devbadge_slash)
             # Prefer multi-guild list; fallback to single guild_id; else global
             target_guild_ids = cfg.guild_ids or ([cfg.guild_id] if cfg.guild_id else [])
@@ -96,10 +96,10 @@ def build_bot(cfg: Config) -> commands.Bot:
                         logger.exception(f"Failed to clear commands for guild {gid}")
                     bot.tree.add_command(browse_cmd, guild=guild_obj)
                     bot.tree.add_command(help_cmd, guild=guild_obj)
+                    bot.tree.add_command(list_cmd, guild=guild_obj)
                     if cfg.owner_user_id is not None:
                         bot.tree.add_command(sync_cmd, guild=guild_obj)
                         bot.tree.add_command(folders_cmd, guild=guild_obj)
-                        bot.tree.add_command(list_cmd, guild=guild_obj)
                         bot.tree.add_command(devbadge_cmd, guild=guild_obj)
                     synced = await bot.tree.sync(guild=guild_obj)
                     logger.info(f"Slash commands synced for guild {gid}: {[c.name for c in synced]}")
@@ -108,10 +108,10 @@ def build_bot(cfg: Config) -> commands.Bot:
                 bot.tree.clear_commands(guild=None)
                 bot.tree.add_command(browse_cmd)
                 bot.tree.add_command(help_cmd)
+                bot.tree.add_command(list_cmd)
                 if cfg.owner_user_id is not None:
                     bot.tree.add_command(sync_cmd)
                     bot.tree.add_command(folders_cmd)
-                    bot.tree.add_command(list_cmd)
                     bot.tree.add_command(devbadge_cmd)
                 synced = await bot.tree.sync()
                 logger.info(f"Global slash commands synced: {[c.name for c in synced]}")
@@ -178,23 +178,45 @@ def build_bot(cfg: Config) -> commands.Bot:
         except Exception:
             pass
 
+    # Lock to prevent concurrent scans
+    _cache_lock = asyncio.Lock()
+    _movies_lock = asyncio.Lock()
+    _tv_lock = asyncio.Lock()
+    _music_lock = asyncio.Lock()
+
     async def ensure_cache_up_to_date(force: bool = False) -> Dict[str, List[str]]:
         data = cache.get()
-        if force or data is None:
+        if data is not None and not force:
+            return data
+        async with _cache_lock:
+            # Double-check after acquiring lock
+            data = cache.get()
+            if data is not None and not force:
+                return data
+            logger.info("Book cache is empty, scanning library via SFTP...")
             loop = asyncio.get_running_loop()
             data = await loop.run_in_executor(None, scanner.scan_library)
             cache.set(data)
+            logger.info(f"Book scan complete: found {len(data)} authors")
         return data
 
     async def ensure_movies_up_to_date(force: bool = False) -> List[str]:
         if not cfg.movies_root_path:
             return []
         data = movies_cache.get()  # type: ignore
-        if force or data is None:
+        if data is not None and not force:
+            return data  # type: ignore
+        async with _movies_lock:
+            data = movies_cache.get()  # type: ignore
+            if data is not None and not force:
+                return data  # type: ignore
             loop = asyncio.get_running_loop()
             def _scan_movies():
                 try:
-                    return scanner.scan_movies(cfg.movies_root_path or "", cfg.movie_extensions)
+                    logger.info("Scanning movies via SFTP...")
+                    result = scanner.scan_movies(cfg.movies_root_path or "", cfg.movie_extensions)
+                    logger.info(f"Movie scan complete: found {len(result)} movies")
+                    return result
                 except Exception:
                     logger.exception("Movie scan failed")
                     return []
@@ -206,11 +228,19 @@ def build_bot(cfg: Config) -> commands.Bot:
         if not cfg.tv_root_path:
             return {}
         data = tv_cache.get()
-        if force or data is None:
+        if data is not None and not force:
+            return data
+        async with _tv_lock:
+            data = tv_cache.get()
+            if data is not None and not force:
+                return data
             loop = asyncio.get_running_loop()
             def _scan_tv():
                 try:
-                    return scanner.scan_tv(cfg.tv_root_path or "", cfg.tv_extensions)
+                    logger.info("Scanning TV shows via SFTP...")
+                    result = scanner.scan_tv(cfg.tv_root_path or "", cfg.tv_extensions)
+                    logger.info(f"TV scan complete: found {len(result)} shows")
+                    return result
                 except Exception:
                     logger.exception("TV scan failed")
                     return {}
@@ -222,11 +252,19 @@ def build_bot(cfg: Config) -> commands.Bot:
         if not cfg.music_root_path:
             return {}
         data = music_cache.get()
-        if force or data is None:
+        if data is not None and not force:
+            return data
+        async with _music_lock:
+            data = music_cache.get()
+            if data is not None and not force:
+                return data
             loop = asyncio.get_running_loop()
             def _scan_music():
                 try:
-                    return scanner.scan_music(cfg.music_root_path or "", cfg.music_extensions)
+                    logger.info("Scanning music via SFTP...")
+                    result = scanner.scan_music(cfg.music_root_path or "", cfg.music_extensions)
+                    logger.info(f"Music scan complete: found {len(result)} artists")
+                    return result
                 except Exception:
                     logger.exception("Music scan failed")
                     return {}
@@ -314,17 +352,22 @@ def build_bot(cfg: Config) -> commands.Bot:
             await interaction.response.send_message("HTTP link server is not ready yet. Please try again shortly.", ephemeral=True)
             return
 
-        # Defer early to avoid interaction timeout
+        # Defer early to avoid interaction timeout - show "thinking" indicator while loading
         try:
-            await interaction.response.defer(ephemeral=True, thinking=False)
+            await interaction.response.defer(ephemeral=True, thinking=True)
         except Exception:
             pass
 
         # Preload caches
-        books_data = await ensure_cache_up_to_date()
-        movies_list = await ensure_movies_up_to_date()
-        tv_data = await ensure_tv_up_to_date()
-        music_data = await ensure_music_up_to_date()
+        try:
+            books_data = await ensure_cache_up_to_date()
+            movies_list = await ensure_movies_up_to_date()
+            tv_data = await ensure_tv_up_to_date()
+            music_data = await ensure_music_up_to_date()
+        except Exception as e:
+            logger.exception("Failed to load caches for browse command")
+            await interaction.followup.send(f"Failed to load library data: {str(e)}", ephemeral=True)
+            return
 
         def get_books_data_local():
             return books_data
@@ -446,13 +489,10 @@ def build_bot(cfg: Config) -> commands.Bot:
             return
         await interaction.response.send_message(content="Here are the current top-level folders.", files=files, ephemeral=True)
 
-    # Owner-only: list folder names: Movies (top-level dirs), TV (shows with seasons)
+    # Public: list folder names: Movies (top-level dirs), TV (shows with seasons)
     async def list_slash(interaction: discord.Interaction, kind: Optional[str] = None):
-        if cfg.owner_user_id is not None and interaction.user.id != cfg.owner_user_id:
-            await interaction.response.send_message("Not authorized.", ephemeral=True)
-            return
         try:
-            await interaction.response.defer(ephemeral=True, thinking=False)
+            await interaction.response.defer(ephemeral=False, thinking=False)
         except Exception:
             pass
         # Normalize filter
@@ -527,7 +567,7 @@ def build_bot(cfg: Config) -> commands.Bot:
             tv_map = await collect_tv_dirs_and_seasons(cfg.tv_root_path)
 
         if not movies_dirs and not tv_map:
-            await interaction.followup.send("No files found (check MOVIES_ROOT_PATH/TV_ROOT_PATH).", ephemeral=True)
+            await interaction.followup.send("No files found (check MOVIES_ROOT_PATH/TV_ROOT_PATH).", ephemeral=False)
             return
         # Build markdown strings and chunk to Discord limits (~2000 chars)
         def make_sections():
@@ -558,7 +598,7 @@ def build_bot(cfg: Config) -> commands.Bot:
                     content = content[split+1:]
                 else:
                     content = content[len(chunk):]
-                await interaction.followup.send(chunk, ephemeral=True)
+                await interaction.followup.send(chunk, ephemeral=False)
 
     async def devbadge_slash(interaction: discord.Interaction):
         # Permission check
