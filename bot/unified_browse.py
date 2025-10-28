@@ -102,31 +102,37 @@ class UnifiedBrowserView(discord.ui.View):
         end = min(start + self.per_page, total)
         page_items = self._current_list[start:end]
         self.add_item(ItemSelect(placeholder, page_items))
-        # Nav buttons
+
         async def to_first(inter: discord.Interaction):
             self.page_index = 0
             await self._refresh_category(inter)
+
         async def to_prev(inter: discord.Interaction):
             if self.page_index > 0:
                 self.page_index -= 1
             await self._refresh_category(inter)
+
         async def to_next(inter: discord.Interaction):
             if (self.page_index + 1) * self.per_page < total:
                 self.page_index += 1
             await self._refresh_category(inter)
+
         async def to_last(inter: discord.Interaction):
             self.page_index = max(0, (total - 1) // self.per_page)
             await self._refresh_category(inter)
-        first_btn = _make_button("⏮", discord.ButtonStyle.secondary, to_first)
-        prev_btn = _make_button("◀", discord.ButtonStyle.secondary, to_prev)
-        next_btn = _make_button("▶", discord.ButtonStyle.secondary, to_next)
-        last_btn = _make_button("⏭", discord.ButtonStyle.secondary, to_last)
-        # Disable according to bounds
+
+        first_btn = _make_button("<<", discord.ButtonStyle.secondary, to_first)
+        prev_btn = _make_button("<", discord.ButtonStyle.secondary, to_prev)
+        next_btn = _make_button(">", discord.ButtonStyle.secondary, to_next)
+        last_btn = _make_button(">>", discord.ButtonStyle.secondary, to_last)
+
+        # Disable buttons according to bounds
         first_btn.disabled = self.page_index <= 0
         prev_btn.disabled = self.page_index <= 0
         last_page_index = max(0, (total - 1) // self.per_page)
         next_btn.disabled = self.page_index >= last_page_index
         last_btn.disabled = self.page_index >= last_page_index
+
         self.add_item(first_btn)
         self.add_item(prev_btn)
         self.add_item(next_btn)
@@ -197,59 +203,82 @@ class UnifiedBrowserView(discord.ui.View):
         if not self.category:
             await interaction.response.send_message("No category selected.", ephemeral=True)
             return
+
+        deferred = False
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.defer(ephemeral=True, thinking=True)
+                deferred = True
+            except Exception:
+                deferred = False
+
         url = f"{self.base_url}/links?kind={self.category}&name={urllib.parse.quote_plus(item_name)}"
-        # Offer an "Open Links" button regardless, as a fallback
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label="Open Links", url=url))
 
         dm_sent = False
-        dm_error = None
+        dm_error: Optional[str] = None
+        items: List[Tuple[str, str, int]] = []
+        video_items: List[Tuple[str, str, int]] = []
+
         if self.build_links:
-            # Build links in a thread to avoid blocking the event loop
             loop = asyncio.get_running_loop()
             try:
-                items: List[Tuple[str, str, int]] = await loop.run_in_executor(None, lambda: self.build_links(self.category or "", item_name))
-                video_items: List[Tuple[str, str, int]] = []
-                
-                # Get video player links for movies and TV
+                items = await loop.run_in_executor(
+                    None, lambda: self.build_links(self.category or "", item_name)
+                )
+
                 if self.build_video_links and self.category in ("movies", "tv"):
                     try:
-                        video_items = await loop.run_in_executor(None, lambda: self.build_video_links(self.category or "", item_name))
+                        video_items = await loop.run_in_executor(
+                            None, lambda: self.build_video_links(self.category or "", item_name)
+                        )
                     except Exception:
                         video_items = []
 
                 if items or video_items:
-                    # Build a concise DM message
                     lines: List[str] = []
                     title = f"Links for {self.category.title()}: {item_name}"
                     lines.append(title)
-                    
+
                     if video_items:
-                        lines.append("🎬 Watch online:")
-                        for filename, link, size in video_items[:10]:  # Limit video links
-                            lines.append(f"- {filename} — {link}")
-                        lines.append("")  # Empty line separator
-                    
+                        lines.append("Watch online:")
+                        for filename, link, size in video_items[:10]:
+                            lines.append(f"- {filename}: {link}")
+                        lines.append("")
+
                     if items:
-                        lines.append("📁 Direct downloads:")
-                        for filename, link, size in items[:50]:  # cap to reasonable number
-                            lines.append(f"- {filename} — {link}")
-                    
+                        lines.append("Direct downloads:")
+                        for filename, link, size in items[:40]:
+                            lines.append(f"- {filename}: {link}")
+
                     content = "\n".join(lines)
-                    await interaction.user.send(content)
-                    dm_sent = True
+                    try:
+                        await interaction.user.send(content)
+                        dm_sent = True
+                    except discord.Forbidden:
+                        dm_error = "I can't DM you (privacy settings block direct messages)."
+                    except discord.HTTPException as exc:
+                        dm_error = f"Failed to send DM ({exc.status})."
+                    except Exception as exc:
+                        dm_error = str(exc)
                 else:
                     dm_error = "No files found for that selection."
-            except Exception as e:
-                dm_error = str(e)
+            except Exception as exc:
+                dm_error = str(exc)
 
-        # Respond ephemerally with status and the fallback button
         if dm_sent:
             msg = "I've sent you a DM with direct download links. If you don't see it, check your DM privacy settings."
         else:
             suffix = f" Reason: {dm_error}" if dm_error else ""
             msg = f"Couldn't send a DM with direct links.{suffix} You can still open the link page."
-        await interaction.response.send_message(msg, view=view, ephemeral=True)
+
+        sender = (
+            interaction.followup.send
+            if deferred or interaction.response.is_done()
+            else interaction.response.send_message
+        )
+        await sender(msg, view=view, ephemeral=True)
 
     async def _refresh_category(self, interaction: discord.Interaction):
         # Re-render current category keeping new page index

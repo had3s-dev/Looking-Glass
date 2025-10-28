@@ -310,10 +310,12 @@ def build_bot(cfg: Config) -> commands.Bot:
             await ctx.send("HTTP link server is not ready yet. Please try again shortly.")
             return
         # Ensure caches are loaded (non-forced)
-        books_data = await ensure_cache_up_to_date()
-        movies_list = await ensure_movies_up_to_date()
-        tv_data = await ensure_tv_up_to_date()
-        music_data = await ensure_music_up_to_date()
+        books_data, movies_list, tv_data, music_data = await asyncio.gather(
+            ensure_cache_up_to_date(),
+            ensure_movies_up_to_date(),
+            ensure_tv_up_to_date(),
+            ensure_music_up_to_date(),
+        )
 
         def get_books_data_local():
             return books_data
@@ -360,10 +362,12 @@ def build_bot(cfg: Config) -> commands.Bot:
 
         # Preload caches
         try:
-            books_data = await ensure_cache_up_to_date()
-            movies_list = await ensure_movies_up_to_date()
-            tv_data = await ensure_tv_up_to_date()
-            music_data = await ensure_music_up_to_date()
+            books_data, movies_list, tv_data, music_data = await asyncio.gather(
+                ensure_cache_up_to_date(),
+                ensure_movies_up_to_date(),
+                ensure_tv_up_to_date(),
+                ensure_music_up_to_date(),
+            )
         except Exception as e:
             logger.exception("Failed to load caches for browse command")
             await interaction.followup.send(f"Failed to load library data: {str(e)}", ephemeral=True)
@@ -410,7 +414,7 @@ def build_bot(cfg: Config) -> commands.Bot:
             ),
             color=discord.Color.blurple()
         )
-        embed.add_field(name="Commands", value="`/browse` — browse and get links\n`/help` — show this help", inline=False)
+        embed.add_field(name="Commands", value="`/browse` - browse and get links\n`/help` - show this help", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=False)
 
     # Owner-only: force re-sync slash commands
@@ -755,3 +759,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

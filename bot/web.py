@@ -254,23 +254,20 @@ class LinkServer:
         if not items and not video_items:
             body.append("<p>No files found.</p>")
         else:
-            # Video player links for movies and TV
             if video_items:
-                body.append("<h2>🎬 Watch Online</h2>")
+                body.append("<h2>Watch Online</h2>")
                 body.append("<ul>")
                 for filename, url, size in video_items:
                     body.append(f"<li><a href='{html.escape(url)}' target='_blank'>{html.escape(filename)}</a> <small>({size} bytes)</small></li>")
                 body.append("</ul>")
-            
-            # Direct download links
+
             if items:
-                if video_items:
-                    body.append("<h2>📁 Direct Downloads</h2>")
+                body.append("<h2>Direct Downloads</h2>")
                 body.append("<ul>")
                 for filename, url, size in items:
                     body.append(f"<li><a href='{html.escape(url)}'>{html.escape(filename)}</a> <small>({size} bytes)</small></li>")
                 body.append("</ul>")
-        
+
         return web.Response(text="\n".join(body), content_type='text/html')
 
     def build_links(self, kind: str, name: str) -> List[Tuple[str, str, int]]:
